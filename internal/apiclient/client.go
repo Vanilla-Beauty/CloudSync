@@ -84,13 +84,10 @@ func (c *Client) ListMounts() ([]ipc.MountRecord, error) {
 }
 
 // AddMount tells the daemon to start watching localPath → remotePrefix.
-// bucket and region are optional; empty string falls back to the daemon's configured defaults.
-func (c *Client) AddMount(localPath, remotePrefix, bucket, region string) (*ipc.MountRecord, error) {
+func (c *Client) AddMount(localPath, remotePrefix string) (*ipc.MountRecord, error) {
 	body, _ := json.Marshal(map[string]string{
 		"local_path":    localPath,
 		"remote_prefix": remotePrefix,
-		"bucket":        bucket,
-		"region":        region,
 	})
 	resp, err := c.httpClient.Post(c.baseURL+"/mounts", "application/json", bytes.NewReader(body))
 	if err != nil {
@@ -130,31 +127,6 @@ func (c *Client) RemoveMount(localPath string, deleteRemote bool) error {
 		var e map[string]string
 		_ = json.NewDecoder(resp.Body).Decode(&e)
 		return fmt.Errorf("remove mount failed: %s", e["error"])
-	}
-	return nil
-}
-
-// PauseMount suspends syncing for the given local path.
-func (c *Client) PauseMount(localPath string) error {
-	return c.postMountAction("/mounts/pause", localPath)
-}
-
-// ResumeMount resumes syncing for the given local path.
-func (c *Client) ResumeMount(localPath string) error {
-	return c.postMountAction("/mounts/resume", localPath)
-}
-
-func (c *Client) postMountAction(endpoint, localPath string) error {
-	body, _ := json.Marshal(map[string]string{"local_path": localPath})
-	resp, err := c.httpClient.Post(c.baseURL+endpoint, "application/json", bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("daemon is not running — use 'cloudsync start'")
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		var e map[string]string
-		_ = json.NewDecoder(resp.Body).Decode(&e)
-		return fmt.Errorf("request failed: %s", e["error"])
 	}
 	return nil
 }

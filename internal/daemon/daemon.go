@@ -25,7 +25,6 @@ const (
 // Program implements service.Interface for kardianos/service.
 type Program struct {
 	logger       *zap.Logger
-	metadata     *storage.MetadataStore
 	mountManager *MountManager
 	apiServer    *apiserver.Server
 	stopCh       chan struct{}
@@ -60,9 +59,6 @@ func (p *Program) Stop(s service.Service) error {
 
 	if p.mountManager != nil {
 		p.mountManager.StopAll()
-	}
-	if p.metadata != nil {
-		_ = p.metadata.Close()
 	}
 	if p.apiServer != nil {
 		p.apiServer.Stop()
@@ -100,12 +96,7 @@ func (p *Program) run() {
 	}
 	p.logger = logger
 
-	metadata, err := storage.OpenMetadataStore(configDir + "/metadata.db")
-	if err != nil {
-		logger.Warn("metadata db unavailable, using in-memory store", zap.Error(err))
-		metadata = storage.NewMetadataStore()
-	}
-	p.metadata = metadata
+	metadata := storage.NewMetadataStore()
 	rl := limiter.NewRateLimiter(cfg.Performance.MaxConcurrent, cfg.Performance.QPS)
 
 	cosClient, err := storage.NewCOSClient(&cfg.COS, metadata, logger)

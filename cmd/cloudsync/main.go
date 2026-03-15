@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,13 +12,9 @@ import (
 	"github.com/cloudsync/cloudsync/internal/apiclient"
 	"github.com/cloudsync/cloudsync/internal/config"
 	"github.com/cloudsync/cloudsync/internal/daemon"
-	"github.com/cloudsync/cloudsync/internal/filter"
 	"github.com/cloudsync/cloudsync/internal/ipc"
-	"github.com/cloudsync/cloudsync/internal/limiter"
-	"github.com/cloudsync/cloudsync/internal/storage"
 	"github.com/kardianos/service"
 	"github.com/spf13/cobra"
-	"go.uber.org/zap"
 )
 
 func main() {
@@ -40,13 +35,9 @@ func rootCmd() *cobra.Command {
 		stopCmd(),
 		statusCmd(),
 		mountCmd(),
-		downloadCmd(),
 		unmountCmd(),
 		deleteCmd(),
 		lsCmd(),
-		pauseCmd(),
-		resumeCmd(),
-		syncCmd(),
 	)
 	return root
 }
@@ -58,21 +49,23 @@ func initCmd() *cobra.Command {
 		secretID  string
 		secretKey string
 		bucket    string
+		region    string
 	)
 	cmd := &cobra.Command{
 		Use:   "init",
 		Short: "Configure COS credentials and write config.json",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runInit(secretID, secretKey, bucket)
+			return runInit(secretID, secretKey, bucket, region)
 		},
 	}
 	cmd.Flags().StringVar(&secretID, "secret-id", "", "COS SecretId")
 	cmd.Flags().StringVar(&secretKey, "secret-key", "", "COS SecretKey")
-	cmd.Flags().StringVar(&bucket, "bucket", "", "Default COS bucket (skip interactive selection)")
+	cmd.Flags().StringVar(&bucket, "bucket", "", "COS bucket name")
+	cmd.Flags().StringVar(&region, "region", "", "COS region (default: ap-guangzhou)")
 	return cmd
 }
 
-func runInit(secretID, secretKey, bucket string) error {
+func runInit(secretID, secretKey, bucket, region string) error {
 	configDir, err := ipc.ConfigDir()
 	if err != nil {
 		return err
@@ -82,6 +75,7 @@ func runInit(secretID, secretKey, bucket string) error {
 	}
 
 	reader := bufio.NewReader(os.Stdin)
+
 	prompt := func(label, current string) string {
 		if current != "" {
 			return current
@@ -93,47 +87,22 @@ func runInit(secretID, secretKey, bucket string) error {
 
 	secretID = prompt("COS SecretId", secretID)
 	secretKey = prompt("COS SecretKey", secretKey)
-
-	// Fetch available buckets and let the user choose one.
-	var chosenBucket, chosenRegion string
-	if bucket != "" {
-		// User bypassed selection with --bucket; region is unknown, leave empty (daemon default applies).
-		chosenBucket = bucket
-	} else {
-		fmt.Println("Fetching bucket list...")
-		buckets, err := storage.ListBuckets(context.Background(), secretID, secretKey)
-		if err != nil {
-			return fmt.Errorf("list buckets: %w", err)
+	bucket = prompt("COS Bucket", bucket)
+	if region == "" {
+		fmt.Print("COS Region [ap-guangzhou]: ")
+		v, _ := reader.ReadString('\n')
+		v = strings.TrimSpace(v)
+		if v == "" {
+			v = "ap-guangzhou"
 		}
-		if len(buckets) == 0 {
-			return fmt.Errorf("no buckets found for these credentials")
-		}
-
-		fmt.Println()
-		for i, b := range buckets {
-			fmt.Printf("  [%d] %s  (%s)  created %s\n", i+1, b.Name, b.Region, b.CreationDate)
-		}
-		fmt.Print("\nSelect default bucket [1]: ")
-		line, _ := reader.ReadString('\n')
-		line = strings.TrimSpace(line)
-
-		idx := 1
-		if line != "" {
-			if _, err := fmt.Sscanf(line, "%d", &idx); err != nil || idx < 1 || idx > len(buckets) {
-				return fmt.Errorf("invalid selection %q", line)
-			}
-		}
-		chosen := buckets[idx-1]
-		chosenBucket = chosen.Name
-		chosenRegion = chosen.Region
-		fmt.Printf("Selected: %s (%s)\n", chosenBucket, chosenRegion)
+		region = v
 	}
 
 	cfg := config.DefaultConfig()
 	cfg.COS.SecretID = secretID
 	cfg.COS.SecretKey = secretKey
-	cfg.COS.Bucket = chosenBucket
-	cfg.COS.Region = chosenRegion
+	cfg.COS.Bucket = bucket
+	cfg.COS.Region = region
 
 	cfgPath, _ := ipc.ConfigFilePath()
 	if err := config.Save(cfgPath, cfg); err != nil {
@@ -281,7 +250,6 @@ func runStatus() error {
 
 func mountCmd() *cobra.Command {
 	var fromHome bool
-	var bucket string
 	cmd := &cobra.Command{
 		Use:   "mount <path> [remote]",
 		Short: "Start syncing a local directory",
@@ -289,24 +257,21 @@ func mountCmd() *cobra.Command {
 
   mount <path>               Remote prefix = basename of path  (e.g. /a/b/c → c/)
   mount --from-home <path>   Remote prefix = path relative to $HOME  (e.g. ~/a/b/c → a/b/c/)
-  mount <path> <remote>      Remote prefix = explicitly specified value
-
-Use --bucket to override the default bucket set during 'cloudsync init'.`,
+  mount <path> <remote>      Remote prefix = explicitly specified value`,
 		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			remote := ""
 			if len(args) == 2 {
 				remote = args[1]
 			}
-			return runMount(args[0], remote, bucket, fromHome)
+			return runMount(args[0], remote, fromHome)
 		},
 	}
 	cmd.Flags().BoolVar(&fromHome, "from-home", false, "Use path relative to $HOME as remote prefix")
-	cmd.Flags().StringVar(&bucket, "bucket", "", "COS bucket to use (overrides default)")
 	return cmd
 }
 
-func runMount(path, remote, bucket string, fromHome bool) error {
+func runMount(path, remote string, fromHome bool) error {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		return fmt.Errorf("resolve path: %w", err)
@@ -315,8 +280,10 @@ func runMount(path, remote, bucket string, fromHome bool) error {
 	var prefix string
 	switch {
 	case remote != "":
+		// Mode 3: explicit remote path
 		prefix = strings.TrimSuffix(remote, "/") + "/"
 	case fromHome:
+		// Mode 2: relative to $HOME
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return fmt.Errorf("get home dir: %w", err)
@@ -327,6 +294,7 @@ func runMount(path, remote, bucket string, fromHome bool) error {
 		}
 		prefix = filepath.ToSlash(rel) + "/"
 	default:
+		// Mode 1: basename only
 		prefix = filepath.Base(absPath) + "/"
 	}
 
@@ -334,91 +302,11 @@ func runMount(path, remote, bucket string, fromHome bool) error {
 	if err != nil {
 		return err
 	}
-	rec, err := client.AddMount(absPath, prefix, bucket, "")
+	rec, err := client.AddMount(absPath, prefix)
 	if err != nil {
 		return err
 	}
-	msg := fmt.Sprintf("Mounted: %s → %s (id: %s)", rec.LocalPath, rec.RemotePrefix, rec.ID)
-	if rec.Bucket != "" {
-		msg += fmt.Sprintf(" [bucket: %s]", rec.Bucket)
-	}
-	fmt.Println(msg)
-	return nil
-}
-
-// ── download ──────────────────────────────────────────────────────────────────
-
-func downloadCmd() *cobra.Command {
-	var toHome bool
-	var bucket string
-	cmd := &cobra.Command{
-		Use:   "download <remote> [local]",
-		Short: "Download a remote COS prefix to a local directory and start bidirectional sync",
-		Long: `Download a remote COS prefix to a local directory and establish a sync mount.
-Three modes:
-
-  download <remote>              Local path = current directory / basename(remote)
-  download --to-home <remote>    Local path = $HOME/<remote>
-  download <remote> <local>      Explicit local path
-
-Use --bucket to override the default bucket set during 'cloudsync init'.`,
-		Args: cobra.RangeArgs(1, 2),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			local := ""
-			if len(args) == 2 {
-				local = args[1]
-			}
-			return runDownload(args[0], local, bucket, toHome)
-		},
-	}
-	cmd.Flags().BoolVar(&toHome, "to-home", false, "Place the local directory under $HOME")
-	cmd.Flags().StringVar(&bucket, "bucket", "", "COS bucket to use (overrides default)")
-	return cmd
-}
-
-func runDownload(remote, local, bucket string, toHome bool) error {
-	prefix := strings.TrimSuffix(remote, "/") + "/"
-
-	var absLocal string
-	switch {
-	case local != "":
-		var err error
-		absLocal, err = filepath.Abs(local)
-		if err != nil {
-			return fmt.Errorf("resolve path: %w", err)
-		}
-	case toHome:
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return fmt.Errorf("get home dir: %w", err)
-		}
-		absLocal = filepath.Join(home, filepath.FromSlash(strings.TrimSuffix(remote, "/")))
-	default:
-		cwd, err := os.Getwd()
-		if err != nil {
-			return fmt.Errorf("get working dir: %w", err)
-		}
-		absLocal = filepath.Join(cwd, filepath.Base(strings.TrimSuffix(remote, "/")))
-	}
-
-	if err := os.MkdirAll(absLocal, 0755); err != nil {
-		return fmt.Errorf("create local dir: %w", err)
-	}
-
-	client, err := newClient()
-	if err != nil {
-		return err
-	}
-	rec, err := client.AddMount(absLocal, prefix, bucket, "")
-	if err != nil {
-		return err
-	}
-	msg := fmt.Sprintf("Downloading: %s → %s (id: %s)", rec.RemotePrefix, rec.LocalPath, rec.ID)
-	if rec.Bucket != "" {
-		msg += fmt.Sprintf(" [bucket: %s]", rec.Bucket)
-	}
-	fmt.Println(msg)
-	fmt.Println("Sync established. Remote files will be downloaded in the background.")
+	fmt.Printf("Mounted: %s → %s (id: %s)\n", rec.LocalPath, rec.RemotePrefix, rec.ID)
 	return nil
 }
 
@@ -529,153 +417,10 @@ func newClient() (*apiclient.Client, error) {
 }
 
 func printMountsTable(mounts []ipc.MountRecord) {
-	fmt.Printf("%-10s  %-35s  %-20s  %-6s  %s\n", "ID", "LOCAL PATH", "REMOTE PREFIX", "STATUS", "LAST SYNC")
-	fmt.Println(strings.Repeat("-", 95))
+	fmt.Printf("%-10s  %-40s  %-20s  %s\n", "ID", "LOCAL PATH", "REMOTE PREFIX", "ADDED AT")
+	fmt.Println(strings.Repeat("-", 90))
 	for _, m := range mounts {
-		status := "active"
-		if m.Paused {
-			status = "paused"
-		}
-		lastSync := "-"
-		if m.LastSync != nil {
-			lastSync = m.LastSync.Local().Format("2006-01-02 15:04:05")
-		}
-		fmt.Printf("%-10s  %-35s  %-20s  %-6s  %s\n",
-			m.ID, m.LocalPath, m.RemotePrefix, status, lastSync)
-		fmt.Printf("%-10s  uploads=%-6d downloads=%-6d deletes=%-6d errors=%d\n",
-			"", m.Uploads, m.Downloads, m.Deletes, m.Errors)
+		fmt.Printf("%-10s  %-40s  %-20s  %s\n",
+			m.ID, m.LocalPath, m.RemotePrefix, m.AddedAt.Local().Format(time.RFC3339))
 	}
-}
-
-// ── pause ─────────────────────────────────────────────────────────────────────
-
-func pauseCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "pause <path>",
-		Short: "Pause syncing for a mounted directory",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			absPath, err := filepath.Abs(args[0])
-			if err != nil {
-				return fmt.Errorf("resolve path: %w", err)
-			}
-			client, err := newClient()
-			if err != nil {
-				return err
-			}
-			if err := client.PauseMount(absPath); err != nil {
-				return err
-			}
-			fmt.Printf("Paused: %s\n", absPath)
-			return nil
-		},
-	}
-}
-
-// ── resume ────────────────────────────────────────────────────────────────────
-
-func resumeCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "resume <path>",
-		Short: "Resume syncing for a paused mounted directory",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			absPath, err := filepath.Abs(args[0])
-			if err != nil {
-				return fmt.Errorf("resolve path: %w", err)
-			}
-			client, err := newClient()
-			if err != nil {
-				return err
-			}
-			if err := client.ResumeMount(absPath); err != nil {
-				return err
-			}
-			fmt.Printf("Resumed: %s\n", absPath)
-			return nil
-		},
-	}
-}
-
-// ── sync ──────────────────────────────────────────────────────────────────────
-
-func syncCmd() *cobra.Command {
-	var bucket string
-	cmd := &cobra.Command{
-		Use:   "sync <path> [remote]",
-		Short: "Run a one-shot bidirectional sync without the daemon",
-		Long: `Perform a single bidirectional sync of <path> to the COS remote prefix and exit.
-The daemon does not need to be running. Config is read from config.json.
-
-  sync <path>           Remote prefix = basename of path
-  sync <path> <remote>  Remote prefix = explicitly specified value
-
-Use --bucket to override the default bucket.`,
-		Args: cobra.RangeArgs(1, 2),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			remote := ""
-			if len(args) == 2 {
-				remote = args[1]
-			}
-			return runSync(args[0], remote, bucket)
-		},
-	}
-	cmd.Flags().StringVar(&bucket, "bucket", "", "COS bucket to use (overrides default)")
-	return cmd
-}
-
-func runSync(path, remote, bucket string) error {
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return fmt.Errorf("resolve path: %w", err)
-	}
-
-	var prefix string
-	if remote != "" {
-		prefix = strings.TrimSuffix(remote, "/") + "/"
-	} else {
-		prefix = filepath.Base(absPath) + "/"
-	}
-
-	cfgPath, _ := ipc.ConfigFilePath()
-	cfg, err := config.Load(cfgPath)
-	if err != nil {
-		return fmt.Errorf("load config: %w", err)
-	}
-
-	cosCfg := cfg.COS
-	if bucket != "" {
-		cosCfg.Bucket = bucket
-	}
-
-	metadata := storage.NewMetadataStore()
-	rl := limiter.NewRateLimiter(cfg.Performance.MaxConcurrent, cfg.Performance.QPS)
-
-	cosClient, err := storage.NewCOSClient(&cosCfg, metadata, zap.NewNop())
-	if err != nil {
-		return fmt.Errorf("init COS client: %w", err)
-	}
-
-	syncer := storage.NewSyncer(cosClient, metadata, rl, zap.NewNop(), absPath, prefix)
-
-	ignorePath := filepath.Join(absPath, ".syncignore")
-	ignoreRules, _ := filter.LoadIgnoreRules(ignorePath)
-	swapDetector := filter.NewSwapDetector()
-	syncer.SetIgnoreFunc(func(p string) bool {
-		rel, err := filepath.Rel(absPath, p)
-		if err != nil {
-			rel = p
-		}
-		return ignoreRules.Match(rel) || swapDetector.IsSwapFile(p)
-	})
-
-	fmt.Printf("Syncing %s ↔ %s/%s ...\n", absPath, cosCfg.Bucket, prefix)
-	if err := syncer.BidirSyncDirectory(context.Background()); err != nil {
-		return fmt.Errorf("sync failed: %w", err)
-	}
-
-	stats := syncer.Stats()
-	fmt.Printf("Done. uploads=%d  downloads=%d  deletes=%d  errors=%d\n",
-		stats.Uploads, stats.Downloads, stats.Deletes, stats.Errors)
-	return nil
 }
