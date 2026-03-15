@@ -34,7 +34,7 @@ cloudsync start
 cloudsync mount ~/documents
 ```
 
-详细步骤见 [GETTING_STARTED.md](./GETTING_STARTED.md)。
+详细步骤见 [GETTING_STARTED.md](./docs/GETTING_STARTED.md)。
 
 ---
 
@@ -187,8 +187,8 @@ SHA-256 增量对比（跳过未变更文件）
 
 | 文档 | 内容 |
 |------|------|
-| [GETTING_STARTED.md](./GETTING_STARTED.md) | 安装、初始化、挂载目录的完整操作指南 |
-| [ARCHITECTURE.md](./ARCHITECTURE.md) | 代码结构、模块设计与数据流详解 |
+| [GETTING_STARTED.md](./docs/GETTING_STARTED.md) | 安装、初始化、挂载目录的完整操作指南 |
+| [ARCHITECTURE.md](./docs/ARCHITECTURE.md) | 代码结构、模块设计与数据流详解 |
 
 ---
 
