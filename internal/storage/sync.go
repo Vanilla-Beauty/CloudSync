@@ -87,6 +87,26 @@ func (s *Syncer) syncOne(ctx context.Context, localPath string) {
 	s.logger.Info("uploaded", zap.String("path", localPath), zap.String("key", remoteKey))
 }
 
+// SyncDirectory walks localRoot and syncs all files to COS.
+// Used for initial full-scan when a mount is (re-)added.
+func (s *Syncer) SyncDirectory(ctx context.Context) error {
+	var paths []string
+	err := filepath.Walk(s.localRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // skip unreadable entries
+		}
+		if !info.IsDir() {
+			paths = append(paths, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	s.SyncFiles(ctx, paths)
+	return nil
+}
+
 // remoteKey converts a local file path to its COS object key
 func (s *Syncer) remoteKey(localPath string) string {
 	rel, err := filepath.Rel(s.localRoot, localPath)

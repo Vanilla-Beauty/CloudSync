@@ -1,21 +1,20 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
-	"io"
 	"os"
-	"os/signal"
+	"os/exec"
 	"path/filepath"
-	"syscall"
+	"strings"
 	"time"
 
+	"github.com/cloudsync/cloudsync/internal/apiclient"
 	"github.com/cloudsync/cloudsync/internal/config"
-	"github.com/cloudsync/cloudsync/internal/limiter"
-	"github.com/cloudsync/cloudsync/internal/storage"
-	"github.com/cloudsync/cloudsync/internal/watcher"
+	"github.com/cloudsync/cloudsync/internal/daemon"
+	"github.com/cloudsync/cloudsync/internal/ipc"
+	"github.com/kardianos/service"
 	"github.com/spf13/cobra"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 )
 
 func main() {
@@ -26,230 +25,375 @@ func main() {
 }
 
 func rootCmd() *cobra.Command {
-	var cfgPath string
-
 	root := &cobra.Command{
 		Use:   "cloudsync",
 		Short: "CloudSync — sync local folders to Tencent Cloud COS",
 	}
-
-	root.PersistentFlags().StringVar(&cfgPath, "config", "", "config file path (default: ~/.cloudsync.yaml)")
-
-	root.AddCommand(initCmd(), startCmd(&cfgPath), statusCmd())
+	root.AddCommand(
+		initCmd(),
+		startCmd(),
+		stopCmd(),
+		statusCmd(),
+		mountCmd(),
+		unmountCmd(),
+		deleteCmd(),
+		lsCmd(),
+	)
 	return root
 }
 
-// initCmd generates default config and .syncignore in the current directory
+// ── init ──────────────────────────────────────────────────────────────────────
+
 func initCmd() *cobra.Command {
-	return &cobra.Command{
+	var (
+		secretID  string
+		secretKey string
+		bucket    string
+		region    string
+	)
+	cmd := &cobra.Command{
 		Use:   "init",
-		Short: "Generate default config and .syncignore in current directory",
+		Short: "Configure COS credentials and write config.json",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runInit()
+			return runInit(secretID, secretKey, bucket, region)
 		},
 	}
+	cmd.Flags().StringVar(&secretID, "secret-id", "", "COS SecretId")
+	cmd.Flags().StringVar(&secretKey, "secret-key", "", "COS SecretKey")
+	cmd.Flags().StringVar(&bucket, "bucket", "", "COS bucket name")
+	cmd.Flags().StringVar(&region, "region", "", "COS region (default: ap-guangzhou)")
+	return cmd
 }
 
-func runInit() error {
-	cwd, err := os.Getwd()
+func runInit(secretID, secretKey, bucket, region string) error {
+	configDir, err := ipc.ConfigDir()
 	if err != nil {
 		return err
 	}
-
-	cfgDst := filepath.Join(cwd, "cloudsync.yaml")
-	syncignoreDst := filepath.Join(cwd, ".syncignore")
-
-	// Write default config
-	defaultCfg := `# CloudSync configuration
-sync:
-  - name: "default"
-    local_path: "."
-    remote_prefix: "sync/"
-    enabled: true
-
-filter:
-  ignore_file: ".syncignore"
-  detect_swap: true
-
-performance:
-  debounce_ms: 2000
-  batch_interval_ms: 5000
-  batch_max_size: 100
-  max_concurrent: 3
-  qps: 10
-
-# Set via environment variables: COS_SECRET_ID, COS_SECRET_KEY, COS_BUCKET, COS_REGION
-cos:
-  secret_id: ""
-  secret_key: ""
-  bucket: ""
-  region: "ap-guangzhou"
-
-log:
-  level: "info"
-  format: "json"
-  output: "cloudsync.log"
-`
-	if err := os.WriteFile(cfgDst, []byte(defaultCfg), 0644); err != nil {
-		return fmt.Errorf("write config: %w", err)
+	if err := os.MkdirAll(configDir, 0700); err != nil {
+		return fmt.Errorf("create config dir: %w", err)
 	}
-	fmt.Printf("Created %s\n", cfgDst)
 
-	defaultIgnore := `# CloudSync ignore rules (gitignore syntax)
-*.tmp
-*.temp
-*.bak
-*.swp
-*.swo
-*.log
-~$*
-.#*
-*~
-node_modules/
-dist/
-build/
-.git/
-.DS_Store
-Thumbs.db
-`
-	if err := os.WriteFile(syncignoreDst, []byte(defaultIgnore), 0644); err != nil {
-		return fmt.Errorf("write .syncignore: %w", err)
+	reader := bufio.NewReader(os.Stdin)
+
+	prompt := func(label, current string) string {
+		if current != "" {
+			return current
+		}
+		fmt.Printf("%s: ", label)
+		v, _ := reader.ReadString('\n')
+		return strings.TrimSpace(v)
 	}
-	fmt.Printf("Created %s\n", syncignoreDst)
+
+	secretID = prompt("COS SecretId", secretID)
+	secretKey = prompt("COS SecretKey", secretKey)
+	bucket = prompt("COS Bucket", bucket)
+	if region == "" {
+		fmt.Print("COS Region [ap-guangzhou]: ")
+		v, _ := reader.ReadString('\n')
+		v = strings.TrimSpace(v)
+		if v == "" {
+			v = "ap-guangzhou"
+		}
+		region = v
+	}
+
+	cfg := config.DefaultConfig()
+	cfg.COS.SecretID = secretID
+	cfg.COS.SecretKey = secretKey
+	cfg.COS.Bucket = bucket
+	cfg.COS.Region = region
+
+	cfgPath, _ := ipc.ConfigFilePath()
+	if err := config.Save(cfgPath, cfg); err != nil {
+		return err
+	}
+	fmt.Printf("Config written to %s\n", cfgPath)
 	return nil
 }
 
-// startCmd starts the sync watcher
-func startCmd(cfgPath *string) *cobra.Command {
+// ── start ─────────────────────────────────────────────────────────────────────
+
+func startCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "start",
-		Short: "Start watching and syncing files",
+		Short: "Start the cloudsyncd daemon",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runStart(*cfgPath)
+			return runStart()
 		},
 	}
 }
 
-func runStart(cfgPath string) error {
-	cfg, err := config.Load(cfgPath)
+func runStart() error {
+	socketPath, err := ipc.SocketPath()
 	if err != nil {
-		return fmt.Errorf("load config: %w", err)
+		return err
+	}
+	client := apiclient.NewClient(socketPath)
+	if client.Ping() == nil {
+		fmt.Println("cloudsyncd is already running")
+		return nil
 	}
 
-	logger, err := buildLogger(cfg)
+	// Find cloudsyncd binary in same directory as this binary
+	selfPath, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("init logger: %w", err)
+		return fmt.Errorf("find executable: %w", err)
 	}
-	defer logger.Sync() //nolint:errcheck
+	daemonPath := filepath.Join(filepath.Dir(selfPath), "cloudsyncd")
+	if _, err := os.Stat(daemonPath); os.IsNotExist(err) {
+		return fmt.Errorf("cloudsyncd binary not found at %s", daemonPath)
+	}
 
-	metadata := storage.NewMetadataStore()
-	rl := limiter.NewRateLimiter(cfg.Performance.MaxConcurrent, cfg.Performance.QPS)
-
-	cosClient, err := storage.NewCOSClient(&cfg.COS, metadata, logger)
+	svcCfg := daemon.BuildServiceConfig(daemonPath)
+	svc, err := service.New(daemon.NewProgram(), svcCfg)
 	if err != nil {
-		return fmt.Errorf("init COS client: %w", err)
+		return fmt.Errorf("service init: %w", err)
 	}
 
-	var watchers []*watcher.SyncWatcher
-	for _, task := range cfg.Sync {
-		if !task.Enabled {
-			continue
+	if err := svc.Install(); err != nil {
+		// If already installed, continue to Start
+		_ = err
+	}
+	if err := svc.Start(); err != nil {
+		// Fall back to direct exec if service start fails (e.g., no root)
+		proc := exec.Command(daemonPath)
+		proc.Stdout = nil
+		proc.Stderr = nil
+		if startErr := proc.Start(); startErr != nil {
+			return fmt.Errorf("start daemon: %w", startErr)
 		}
-		localPath, err := filepath.Abs(task.LocalPath)
-		if err != nil {
-			logger.Warn("invalid local_path", zap.String("name", task.Name), zap.Error(err))
-			continue
-		}
-
-		sw, err := watcher.New(
-			watcher.Config{
-				LocalRoot:    localPath,
-				RemotePrefix: task.RemotePrefix,
-				IgnoreFile:   cfg.Filter.IgnoreFile,
-				DetectSwap:   cfg.Filter.DetectSwap,
-				Perf:         cfg.Performance,
-			},
-			cosClient,
-			metadata,
-			rl,
-			logger,
-		)
-		if err != nil {
-			logger.Error("create watcher failed", zap.String("task", task.Name), zap.Error(err))
-			continue
-		}
-
-		if err := sw.Start(); err != nil {
-			logger.Error("start watcher failed", zap.String("task", task.Name), zap.Error(err))
-			continue
-		}
-
-		logger.Info("watching", zap.String("task", task.Name), zap.String("path", localPath))
-		watchers = append(watchers, sw)
+		_ = proc.Process.Release()
 	}
 
-	if len(watchers) == 0 {
-		return fmt.Errorf("no sync tasks configured or all failed to start")
+	// Poll until socket responds (up to 5s)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if client.Ping() == nil {
+			fmt.Println("cloudsyncd started")
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
+	return fmt.Errorf("cloudsyncd did not start within 5 seconds")
+}
 
-	// Wait for signal
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
+// ── stop ──────────────────────────────────────────────────────────────────────
 
-	logger.Info("shutting down...")
-	for _, sw := range watchers {
-		sw.Stop()
+func stopCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "stop",
+		Short: "Stop the cloudsyncd daemon",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runStop()
+		},
 	}
-	logger.Info("stopped")
+}
+
+func runStop() error {
+	selfPath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("find executable: %w", err)
+	}
+	daemonPath := filepath.Join(filepath.Dir(selfPath), "cloudsyncd")
+	svcCfg := daemon.BuildServiceConfig(daemonPath)
+	svc, err := service.New(daemon.NewProgram(), svcCfg)
+	if err != nil {
+		return fmt.Errorf("service init: %w", err)
+	}
+	if err := svc.Stop(); err != nil {
+		return fmt.Errorf("stop daemon: %w", err)
+	}
+	fmt.Println("cloudsyncd stopped")
 	return nil
 }
 
-// statusCmd prints a simple status message
+// ── status ────────────────────────────────────────────────────────────────────
+
 func statusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
-		Short: "Show sync status",
-		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Printf("CloudSync running — uptime check at %s\n", time.Now().Format(time.RFC3339))
-			fmt.Println("Use `cloudsync start` to begin syncing.")
+		Short: "Show daemon status and active mounts",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runStatus()
 		},
 	}
 }
 
-func buildLogger(cfg *config.Config) (*zap.Logger, error) {
-	level := zap.InfoLevel
-	switch cfg.Log.Level {
-	case "debug":
-		level = zap.DebugLevel
-	case "warn":
-		level = zap.WarnLevel
-	case "error":
-		level = zap.ErrorLevel
+func runStatus() error {
+	client, err := newClient()
+	if err != nil {
+		return err
+	}
+	st, err := client.Status()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Daemon PID:   %d\n", st.DaemonPID)
+	fmt.Printf("Version:      %s\n", st.Version)
+	fmt.Printf("Mounts:       %d\n", st.MountCount)
+
+	mounts, err := client.ListMounts()
+	if err != nil {
+		return err
+	}
+	if len(mounts) == 0 {
+		fmt.Println("\nNo active mounts.")
+		return nil
+	}
+	fmt.Println()
+	printMountsTable(mounts)
+	return nil
+}
+
+// ── mount ─────────────────────────────────────────────────────────────────────
+
+func mountCmd() *cobra.Command {
+	var prefix string
+	cmd := &cobra.Command{
+		Use:   "mount <path>",
+		Short: "Start syncing a local directory",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runMount(args[0], prefix)
+		},
+	}
+	cmd.Flags().StringVar(&prefix, "prefix", "", "Remote prefix (default: basename of path + /)")
+	return cmd
+}
+
+func runMount(path, prefix string) error {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("resolve path: %w", err)
+	}
+	if prefix == "" {
+		prefix = filepath.Base(absPath) + "/"
 	}
 
-	encoderCfg := zap.NewProductionEncoderConfig()
-	encoderCfg.TimeKey = "time"
-	encoderCfg.EncodeTime = zapcore.ISO8601TimeEncoder
+	client, err := newClient()
+	if err != nil {
+		return err
+	}
+	rec, err := client.AddMount(absPath, prefix)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Mounted: %s → %s (id: %s)\n", rec.LocalPath, rec.RemotePrefix, rec.ID)
+	return nil
+}
 
-	var enc zapcore.Encoder
-	if cfg.Log.Format == "console" {
-		enc = zapcore.NewConsoleEncoder(encoderCfg)
-	} else {
-		enc = zapcore.NewJSONEncoder(encoderCfg)
+// ── unmount ───────────────────────────────────────────────────────────────────
+
+func unmountCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "unmount <path>",
+		Short: "Stop syncing a directory (remote files are preserved)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runUnmount(args[0])
+		},
+	}
+}
+
+func runUnmount(path string) error {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("resolve path: %w", err)
+	}
+	client, err := newClient()
+	if err != nil {
+		return err
+	}
+	if err := client.RemoveMount(absPath, false); err != nil {
+		return err
+	}
+	fmt.Printf("Unmounted: %s (remote files preserved)\n", absPath)
+	return nil
+}
+
+// ── delete ────────────────────────────────────────────────────────────────────
+
+func deleteCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "delete <path>",
+		Short: "Stop syncing and delete all remote files for this directory",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runDelete(args[0])
+		},
+	}
+}
+
+func runDelete(path string) error {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("resolve path: %w", err)
 	}
 
-	var w zapcore.WriteSyncer
-	if cfg.Log.Output == "" || cfg.Log.Output == "stdout" {
-		w = zapcore.AddSync(os.Stdout)
-	} else {
-		f, err := os.OpenFile(cfg.Log.Output, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			return nil, err
-		}
-		w = zapcore.AddSync(io.MultiWriter(os.Stdout, f))
+	fmt.Printf("This will delete all remote files for %s.\nContinue? [y/N] ", absPath)
+	reader := bufio.NewReader(os.Stdin)
+	answer, _ := reader.ReadString('\n')
+	if strings.ToLower(strings.TrimSpace(answer)) != "y" {
+		fmt.Println("Aborted.")
+		return nil
 	}
 
-	core := zapcore.NewCore(enc, w, level)
-	return zap.New(core), nil
+	client, err := newClient()
+	if err != nil {
+		return err
+	}
+	if err := client.RemoveMount(absPath, true); err != nil {
+		return err
+	}
+	fmt.Printf("Deleted remote files and unmounted: %s\n", absPath)
+	return nil
+}
+
+// ── ls ────────────────────────────────────────────────────────────────────────
+
+func lsCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "ls",
+		Short: "List active mounts",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runLs()
+		},
+	}
+}
+
+func runLs() error {
+	client, err := newClient()
+	if err != nil {
+		return err
+	}
+	mounts, err := client.ListMounts()
+	if err != nil {
+		return err
+	}
+	if len(mounts) == 0 {
+		fmt.Println("No active mounts.")
+		return nil
+	}
+	printMountsTable(mounts)
+	return nil
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+func newClient() (*apiclient.Client, error) {
+	socketPath, err := ipc.SocketPath()
+	if err != nil {
+		return nil, err
+	}
+	return apiclient.NewClient(socketPath), nil
+}
+
+func printMountsTable(mounts []ipc.MountRecord) {
+	fmt.Printf("%-10s  %-40s  %-20s  %s\n", "ID", "LOCAL PATH", "REMOTE PREFIX", "ADDED AT")
+	fmt.Println(strings.Repeat("-", 90))
+	for _, m := range mounts {
+		fmt.Printf("%-10s  %-40s  %-20s  %s\n",
+			m.ID, m.LocalPath, m.RemotePrefix, m.AddedAt.Local().Format(time.RFC3339))
+	}
 }
