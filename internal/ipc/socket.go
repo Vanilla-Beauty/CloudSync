@@ -12,7 +12,17 @@ type MountRecord struct {
 	ID           string    `json:"id"`
 	LocalPath    string    `json:"local_path"`
 	RemotePrefix string    `json:"remote_prefix"`
+	Bucket       string    `json:"bucket,omitempty"` // overrides config default when set
+	Region       string    `json:"region,omitempty"` // overrides config default when set
 	AddedAt      time.Time `json:"added_at"`
+
+	// Runtime stats — populated on GET /mounts, not persisted to mounts.json.
+	Uploads   int64      `json:"uploads,omitempty"`
+	Downloads int64      `json:"downloads,omitempty"`
+	Deletes   int64      `json:"deletes,omitempty"`
+	Errors    int64      `json:"errors,omitempty"`
+	LastSync  *time.Time `json:"last_sync,omitempty"`
+	Paused    bool       `json:"paused,omitempty"`
 }
 
 // MountsFile is the structure persisted to mounts.json

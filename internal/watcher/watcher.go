@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cloudsync/cloudsync/internal/config"
@@ -28,6 +29,13 @@ type SyncWatcher struct {
 	cancel       context.CancelFunc
 	wg           sync.WaitGroup
 	logger       *zap.Logger
+
+	paused atomic.Bool // toggled by Pause/Resume; checked in handleEvent
+
+	// watchedDirs tracks all directories currently registered with fsnotify.
+	// Used to detect directory Remove events and clean up properly.
+	watchedDirsMu sync.RWMutex
+	watchedDirs   map[string]struct{}
 }
 
 // Config holds the parameters needed to build a SyncWatcher
@@ -66,12 +74,13 @@ func New(
 	batchInterval := time.Duration(cfg.Perf.BatchIntervalMs) * time.Millisecond
 
 	sw := &SyncWatcher{
-		watcher:      fw,
-		ignoreRules:  ignoreRules,
-		localRoot:    cfg.LocalRoot,
-		ctx:          ctx,
-		cancel:       cancel,
-		logger:       logger,
+		watcher:     fw,
+		ignoreRules: ignoreRules,
+		localRoot:   cfg.LocalRoot,
+		ctx:         ctx,
+		cancel:      cancel,
+		logger:      logger,
+		watchedDirs: make(map[string]struct{}),
 	}
 
 	if cfg.DetectSwap {
@@ -133,7 +142,12 @@ func (sw *SyncWatcher) eventLoop() {
 func (sw *SyncWatcher) handleEvent(event fsnotify.Event) {
 	path := event.Name
 
-	// If new directory created, watch it recursively
+	// Drop events while paused (directory structural changes are still tracked).
+	if sw.paused.Load() {
+		return
+	}
+
+	// New directory: register recursively and return (no sync needed for empty dirs).
 	if event.Op&fsnotify.Create != 0 {
 		info, err := os.Lstat(path)
 		if err == nil && info.IsDir() {
@@ -144,8 +158,23 @@ func (sw *SyncWatcher) handleEvent(event fsnotify.Event) {
 		}
 	}
 
-	// Remove events: still pass to syncer (it will handle missing file as delete)
-	// Filter first
+	// Directory removed: propagate deletion to COS and remove from watch set.
+	if event.Op&fsnotify.Remove != 0 {
+		sw.watchedDirsMu.RLock()
+		_, wasDir := sw.watchedDirs[path]
+		sw.watchedDirsMu.RUnlock()
+
+		if wasDir {
+			sw.watchedDirsMu.Lock()
+			delete(sw.watchedDirs, path)
+			sw.watchedDirsMu.Unlock()
+			_ = sw.watcher.Remove(path)
+			sw.debouncer.Cancel(path)
+			go sw.syncer.DeleteDirectory(sw.ctx, path)
+			return
+		}
+	}
+
 	if sw.shouldIgnore(path) {
 		sw.logger.Debug("ignored", zap.String("path", path))
 		return
@@ -173,7 +202,22 @@ func (sw *SyncWatcher) processBatch(paths []string) {
 	sw.syncer.SyncFiles(sw.ctx, paths)
 }
 
-// addPathRecursive watches a directory and all its subdirectories, skipping symlinks
+// Stats returns the accumulated sync statistics for this watcher.
+func (sw *SyncWatcher) Stats() storage.SyncStats {
+	return sw.syncer.Stats()
+}
+
+// Pause suspends event processing. In-flight syncs are not cancelled.
+func (sw *SyncWatcher) Pause() { sw.paused.Store(true) }
+
+// Resume re-enables event processing after a Pause.
+func (sw *SyncWatcher) Resume() { sw.paused.Store(false) }
+
+// IsPaused reports whether the watcher is currently paused.
+func (sw *SyncWatcher) IsPaused() bool { return sw.paused.Load() }
+
+// addPathRecursive watches a directory and all its subdirectories, skipping symlinks.
+// Each watched directory is recorded in watchedDirs.
 func (sw *SyncWatcher) addPathRecursive(root string) error {
 	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -185,6 +229,9 @@ func (sw *SyncWatcher) addPathRecursive(root string) error {
 			return filepath.SkipDir
 		}
 		if info.IsDir() {
+			sw.watchedDirsMu.Lock()
+			sw.watchedDirs[path] = struct{}{}
+			sw.watchedDirsMu.Unlock()
 			return sw.watcher.Add(path)
 		}
 		return nil

@@ -11,10 +11,12 @@ import (
 
 // MountManagerAPI is the interface the handlers require.
 type MountManagerAPI interface {
-	Add(localPath, remotePrefix string) (ipc.MountRecord, error)
+	Add(localPath, remotePrefix, bucket, region string) (ipc.MountRecord, error)
 	Remove(localPath string, deleteRemote bool) error
 	List() []ipc.MountRecord
 	Count() int
+	Pause(localPath string) error
+	Resume(localPath string) error
 }
 
 type handlers struct {
@@ -72,6 +74,8 @@ func (h *handlers) addMount(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		LocalPath    string `json:"local_path"`
 		RemotePrefix string `json:"remote_prefix"`
+		Bucket       string `json:"bucket"`
+		Region       string `json:"region"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -82,7 +86,7 @@ func (h *handlers) addMount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rec, err := h.mm.Add(req.LocalPath, req.RemotePrefix)
+	rec, err := h.mm.Add(req.LocalPath, req.RemotePrefix, req.Bucket, req.Region)
 	if err != nil {
 		h.logger.Warn("mount add failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -111,4 +115,52 @@ func (h *handlers) removeMount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// POST /mounts/pause  {"local_path":"..."}
+func (h *handlers) pauseMount(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		LocalPath string `json:"local_path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if req.LocalPath == "" {
+		writeError(w, http.StatusBadRequest, "local_path is required")
+		return
+	}
+	if err := h.mm.Pause(req.LocalPath); err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "paused"})
+}
+
+// POST /mounts/resume  {"local_path":"..."}
+func (h *handlers) resumeMount(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		LocalPath string `json:"local_path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if req.LocalPath == "" {
+		writeError(w, http.StatusBadRequest, "local_path is required")
+		return
+	}
+	if err := h.mm.Resume(req.LocalPath); err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "resumed"})
 }

@@ -76,11 +76,13 @@ func (mm *MountManager) LoadSaved() error {
 }
 
 // Add creates a new mount, starts its watcher, and persists.
-func (mm *MountManager) Add(localPath, remotePrefix string) (ipc.MountRecord, error) {
+func (mm *MountManager) Add(localPath, remotePrefix, bucket, region string) (ipc.MountRecord, error) {
 	rec := ipc.MountRecord{
 		ID:           randomID(),
 		LocalPath:    localPath,
 		RemotePrefix: remotePrefix,
+		Bucket:       bucket,
+		Region:       region,
 		AddedAt:      time.Now().UTC(),
 	}
 
@@ -139,13 +141,24 @@ func (mm *MountManager) Remove(localPath string, deleteRemote bool) error {
 	return mm.save()
 }
 
-// List returns a copy of all current mount records.
+// List returns a copy of all current mount records with live stats populated.
 func (mm *MountManager) List() []ipc.MountRecord {
 	mm.mu.RLock()
 	defer mm.mu.RUnlock()
 	result := make([]ipc.MountRecord, 0, len(mm.entries))
 	for _, e := range mm.entries {
-		result = append(result, e.record)
+		rec := e.record
+		stats := e.watcher.Stats()
+		rec.Uploads = stats.Uploads
+		rec.Downloads = stats.Downloads
+		rec.Deletes = stats.Deletes
+		rec.Errors = stats.Errors
+		if !stats.LastSync.IsZero() {
+			t := stats.LastSync
+			rec.LastSync = &t
+		}
+		rec.Paused = e.watcher.IsPaused()
+		result = append(result, rec)
 	}
 	return result
 }
@@ -155,6 +168,32 @@ func (mm *MountManager) Count() int {
 	mm.mu.RLock()
 	defer mm.mu.RUnlock()
 	return len(mm.entries)
+}
+
+// Pause suspends syncing for the mount at localPath.
+func (mm *MountManager) Pause(localPath string) error {
+	mm.mu.RLock()
+	defer mm.mu.RUnlock()
+	for _, e := range mm.entries {
+		if e.record.LocalPath == localPath {
+			e.watcher.Pause()
+			return nil
+		}
+	}
+	return fmt.Errorf("no mount found for path: %s", localPath)
+}
+
+// Resume resumes syncing for the mount at localPath.
+func (mm *MountManager) Resume(localPath string) error {
+	mm.mu.RLock()
+	defer mm.mu.RUnlock()
+	for _, e := range mm.entries {
+		if e.record.LocalPath == localPath {
+			e.watcher.Resume()
+			return nil
+		}
+	}
+	return fmt.Errorf("no mount found for path: %s", localPath)
 }
 
 // StopAll stops all watchers (called on daemon shutdown).
@@ -168,6 +207,19 @@ func (mm *MountManager) StopAll() {
 
 // startWatcher creates and starts a SyncWatcher for the given record.
 func (mm *MountManager) startWatcher(rec ipc.MountRecord) error {
+	// Build a COS client for this specific mount, falling back to daemon defaults.
+	cosCfg := mm.cfg.COS
+	if rec.Bucket != "" {
+		cosCfg.Bucket = rec.Bucket
+	}
+	if rec.Region != "" {
+		cosCfg.Region = rec.Region
+	}
+	cosClient, err := storage.NewCOSClient(&cosCfg, mm.metadata, mm.logger)
+	if err != nil {
+		return fmt.Errorf("create COS client for mount: %w", err)
+	}
+
 	ignorePath := filepath.Join(rec.LocalPath, ".syncignore")
 
 	sw, err := watcher.New(
@@ -184,7 +236,7 @@ func (mm *MountManager) startWatcher(rec ipc.MountRecord) error {
 				QPS:             mm.cfg.Performance.QPS,
 			},
 		},
-		mm.cos,
+		cosClient,
 		mm.metadata,
 		mm.rl,
 		mm.logger,
@@ -202,7 +254,7 @@ func (mm *MountManager) startWatcher(rec ipc.MountRecord) error {
 	mm.mu.Unlock()
 
 	// Initial full-directory scan in background, with the same filters as the watcher.
-	syncer := storage.NewSyncer(mm.cos, mm.metadata, mm.rl, mm.logger, rec.LocalPath, rec.RemotePrefix)
+	syncer := storage.NewSyncer(cosClient, mm.metadata, mm.rl, mm.logger, rec.LocalPath, rec.RemotePrefix)
 	ignoreRules, _ := filter.LoadIgnoreRules(ignorePath)
 	swapDetector := filter.NewSwapDetector()
 	syncer.SetIgnoreFunc(func(path string) bool {
@@ -214,7 +266,7 @@ func (mm *MountManager) startWatcher(rec ipc.MountRecord) error {
 	})
 	go func() {
 		ctx := context.Background()
-		if err := syncer.SyncDirectory(ctx); err != nil {
+		if err := syncer.BidirSyncDirectory(ctx); err != nil {
 			mm.logger.Warn("initial sync failed", zap.String("path", rec.LocalPath), zap.Error(err))
 		}
 	}()
