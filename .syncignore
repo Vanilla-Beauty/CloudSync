@@ -1,0 +1,59 @@
+# CloudSync 忽略规则
+# 语法类似 .gitignore
+
+# 临时文件
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+
+# Office 临时锁文件
+~$*
+
+# Emacs 自动保存文件
+.#*
+#*#
+
+# Vim 备份文件
+*~
+
+# 日志文件
+*.log
+
+# 编译产物
+node_modules/
+dist/
+build/
+*.exe
+*.dll
+*.o
+*.a
+*.so
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 版本控制
+.git/
+.svn/
+.hg/
+
+# IDE 文件
+.idea/
+.vscode/
+*.iml
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# 缓存
+.cache/
+*.cache
