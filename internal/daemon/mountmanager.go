@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cloudsync/cloudsync/internal/config"
+	"github.com/cloudsync/cloudsync/internal/filter"
 	"github.com/cloudsync/cloudsync/internal/ipc"
 	"github.com/cloudsync/cloudsync/internal/limiter"
 	"github.com/cloudsync/cloudsync/internal/storage"
@@ -200,8 +201,17 @@ func (mm *MountManager) startWatcher(rec ipc.MountRecord) error {
 	mm.entries[rec.ID] = &watcherEntry{record: rec, watcher: sw}
 	mm.mu.Unlock()
 
-	// Initial full-directory scan in background
+	// Initial full-directory scan in background, with the same filters as the watcher.
 	syncer := storage.NewSyncer(mm.cos, mm.metadata, mm.rl, mm.logger, rec.LocalPath, rec.RemotePrefix)
+	ignoreRules, _ := filter.LoadIgnoreRules(ignorePath)
+	swapDetector := filter.NewSwapDetector()
+	syncer.SetIgnoreFunc(func(path string) bool {
+		rel, err := filepath.Rel(rec.LocalPath, path)
+		if err != nil {
+			rel = path
+		}
+		return ignoreRules.Match(rel) || swapDetector.IsSwapFile(path)
+	})
 	go func() {
 		ctx := context.Background()
 		if err := syncer.SyncDirectory(ctx); err != nil {

@@ -13,12 +13,13 @@ import (
 
 // Syncer orchestrates file synchronization to COS
 type Syncer struct {
-	cos         *COSClient
-	metadata    *MetadataStore
-	rateLimiter *limiter.RateLimiter
-	logger      *zap.Logger
-	localRoot   string
+	cos          *COSClient
+	metadata     *MetadataStore
+	rateLimiter  *limiter.RateLimiter
+	logger       *zap.Logger
+	localRoot    string
 	remotePrefix string
+	shouldIgnore func(string) bool // optional; applied during SyncDirectory
 }
 
 // NewSyncer creates a Syncer for a given local root and remote prefix
@@ -31,6 +32,12 @@ func NewSyncer(cos *COSClient, metadata *MetadataStore, rl *limiter.RateLimiter,
 		localRoot:    localRoot,
 		remotePrefix: remotePrefix,
 	}
+}
+
+// SetIgnoreFunc attaches a filter to be applied during SyncDirectory.
+// paths for which fn returns true are skipped entirely.
+func (s *Syncer) SetIgnoreFunc(fn func(string) bool) {
+	s.shouldIgnore = fn
 }
 
 // SyncFiles syncs a batch of local file paths concurrently
@@ -88,6 +95,7 @@ func (s *Syncer) syncOne(ctx context.Context, localPath string) {
 }
 
 // SyncDirectory walks localRoot and syncs all files to COS.
+// Files matching the ignore function (set via SetIgnoreFunc) are skipped.
 // Used for initial full-scan when a mount is (re-)added.
 func (s *Syncer) SyncDirectory(ctx context.Context) error {
 	var paths []string
@@ -95,9 +103,14 @@ func (s *Syncer) SyncDirectory(ctx context.Context) error {
 		if err != nil {
 			return nil // skip unreadable entries
 		}
-		if !info.IsDir() {
-			paths = append(paths, path)
+		if info.IsDir() {
+			return nil
 		}
+		if s.shouldIgnore != nil && s.shouldIgnore(path) {
+			s.logger.Debug("initial scan: ignored", zap.String("path", path))
+			return nil
+		}
+		paths = append(paths, path)
 		return nil
 	})
 	if err != nil {
