@@ -6,7 +6,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cloudsync/cloudsync/internal/apiclient"
@@ -201,8 +203,41 @@ func runStop() error {
 	if err != nil {
 		return fmt.Errorf("service init: %w", err)
 	}
-	if err := svc.Stop(); err != nil {
-		return fmt.Errorf("stop daemon: %w", err)
+	if err := svc.Stop(); err == nil {
+		fmt.Println("cloudsyncd stopped")
+		return nil
+	}
+
+	// Service manager failed (daemon was started directly, not via systemd).
+	// Fall back to reading the PID file and sending SIGTERM.
+	pidPath, err := ipc.PIDFilePath()
+	if err != nil {
+		return fmt.Errorf("resolve pid file: %w", err)
+	}
+	data, err := os.ReadFile(pidPath)
+	if err != nil {
+		return fmt.Errorf("daemon is not running (pid file not found)")
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return fmt.Errorf("invalid pid file: %w", err)
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return fmt.Errorf("process not found: %w", err)
+	}
+	if err := proc.Signal(syscall.SIGTERM); err != nil {
+		return fmt.Errorf("send SIGTERM to pid %d: %w", pid, err)
+	}
+
+	// Wait up to 5 s for the socket to disappear
+	socketPath, _ := ipc.SocketPath()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(socketPath); os.IsNotExist(err) {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 	fmt.Println("cloudsyncd stopped")
 	return nil

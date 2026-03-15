@@ -140,6 +140,9 @@ func (sw *SyncWatcher) handleEvent(event fsnotify.Event) {
 			if err := sw.addPathRecursive(path); err != nil {
 				sw.logger.Warn("failed to watch new dir", zap.String("path", path), zap.Error(err))
 			}
+			// Scan existing contents to catch files that arrived before watch was registered
+			// (race window between directory creation and watch registration)
+			sw.scanAndEnqueue(path)
 			return
 		}
 	}
@@ -171,6 +174,23 @@ func (sw *SyncWatcher) shouldIgnore(path string) bool {
 func (sw *SyncWatcher) processBatch(paths []string) {
 	sw.logger.Info("syncing batch", zap.Int("count", len(paths)))
 	sw.syncer.SyncFiles(sw.ctx, paths)
+}
+
+// scanAndEnqueue walks a directory and feeds all non-ignored files into the debouncer.
+// This plugs the race window between directory creation and watch registration: files
+// already present inside a newly-created (or moved-in) directory would otherwise be
+// missed because their CREATE events fired before fsnotify started watching that dir.
+func (sw *SyncWatcher) scanAndEnqueue(dir string) {
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		if sw.shouldIgnore(path) {
+			return nil
+		}
+		sw.debouncer.Trigger(path)
+		return nil
+	})
 }
 
 // addPathRecursive watches a directory and all its subdirectories, skipping symlinks
