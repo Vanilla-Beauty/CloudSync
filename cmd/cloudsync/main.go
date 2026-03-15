@@ -249,25 +249,52 @@ func runStatus() error {
 // ── mount ─────────────────────────────────────────────────────────────────────
 
 func mountCmd() *cobra.Command {
-	var prefix string
+	var fromHome bool
 	cmd := &cobra.Command{
-		Use:   "mount <path>",
+		Use:   "mount <path> [remote]",
 		Short: "Start syncing a local directory",
-		Args:  cobra.ExactArgs(1),
+		Long: `Start syncing a local directory to COS. Three modes:
+
+  mount <path>               Remote prefix = basename of path  (e.g. /a/b/c → c/)
+  mount --from-home <path>   Remote prefix = path relative to $HOME  (e.g. ~/a/b/c → a/b/c/)
+  mount <path> <remote>      Remote prefix = explicitly specified value`,
+		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runMount(args[0], prefix)
+			remote := ""
+			if len(args) == 2 {
+				remote = args[1]
+			}
+			return runMount(args[0], remote, fromHome)
 		},
 	}
-	cmd.Flags().StringVar(&prefix, "prefix", "", "Remote prefix (default: basename of path + /)")
+	cmd.Flags().BoolVar(&fromHome, "from-home", false, "Use path relative to $HOME as remote prefix")
 	return cmd
 }
 
-func runMount(path, prefix string) error {
+func runMount(path, remote string, fromHome bool) error {
 	absPath, err := filepath.Abs(path)
 	if err != nil {
 		return fmt.Errorf("resolve path: %w", err)
 	}
-	if prefix == "" {
+
+	var prefix string
+	switch {
+	case remote != "":
+		// Mode 3: explicit remote path
+		prefix = strings.TrimSuffix(remote, "/") + "/"
+	case fromHome:
+		// Mode 2: relative to $HOME
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("get home dir: %w", err)
+		}
+		rel, err := filepath.Rel(home, absPath)
+		if err != nil || strings.HasPrefix(rel, "..") {
+			return fmt.Errorf("path %s is not under $HOME (%s)", absPath, home)
+		}
+		prefix = filepath.ToSlash(rel) + "/"
+	default:
+		// Mode 1: basename only
 		prefix = filepath.Base(absPath) + "/"
 	}
 
