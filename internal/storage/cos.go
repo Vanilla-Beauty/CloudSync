@@ -3,16 +3,48 @@ package storage
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/cloudsync/cloudsync/internal/config"
 	cos "github.com/tencentyun/cos-go-sdk-v5"
 	"go.uber.org/zap"
 )
+
+// BucketInfo contains the name and region of a COS bucket.
+type BucketInfo struct {
+	Name   string
+	Region string
+}
+
+// ListBuckets returns all buckets accessible with the given credentials.
+// It does not require a pre-existing COSClient since it uses the service-level endpoint.
+func ListBuckets(ctx context.Context, secretID, secretKey string) ([]BucketInfo, error) {
+	serviceURL, _ := url.Parse("https://service.cos.myqcloud.com")
+	b := &cos.BaseURL{ServiceURL: serviceURL}
+	client := cos.NewClient(b, &http.Client{
+		Transport: &cos.AuthorizationTransport{
+			SecretID:  secretID,
+			SecretKey: secretKey,
+		},
+	})
+
+	result, _, err := client.Service.Get(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list buckets: %w", err)
+	}
+
+	buckets := make([]BucketInfo, 0, len(result.Buckets))
+	for _, b := range result.Buckets {
+		buckets = append(buckets, BucketInfo{Name: b.Name, Region: b.Region})
+	}
+	return buckets, nil
+}
 
 const maxRetries = 3
 
@@ -109,6 +141,44 @@ func (c *COSClient) List(ctx context.Context, prefix string) ([]string, error) {
 		opt.Marker = result.NextMarker
 	}
 	return keys, nil
+}
+
+// Download downloads a remote object to a local file path.
+func (c *COSClient) Download(ctx context.Context, remoteKey, localPath string) error {
+	return c.withRetry(ctx, func() error {
+		resp, err := c.client.Object.Get(ctx, remoteKey, nil)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+
+		if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
+			return fmt.Errorf("create dirs for %s: %w", localPath, err)
+		}
+
+		f, err := os.Create(localPath)
+		if err != nil {
+			return fmt.Errorf("create %s: %w", localPath, err)
+		}
+		defer f.Close()
+
+		buf := make([]byte, 32*1024)
+		for {
+			n, readErr := resp.Body.Read(buf)
+			if n > 0 {
+				if _, writeErr := f.Write(buf[:n]); writeErr != nil {
+					return fmt.Errorf("write %s: %w", localPath, writeErr)
+				}
+			}
+			if readErr != nil {
+				if readErr == io.EOF {
+					break
+				}
+				return fmt.Errorf("read response body: %w", readErr)
+			}
+		}
+		return nil
+	})
 }
 
 // withRetry runs fn up to maxRetries times with exponential backoff

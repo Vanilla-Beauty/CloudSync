@@ -25,6 +25,7 @@ import (
 type watcherEntry struct {
 	record  ipc.MountRecord
 	watcher *watcher.SyncWatcher
+	cos     *storage.COSClient // may differ from mm.cos when per-mount bucket is set
 }
 
 // MountManager manages the lifecycle of watched directories and persists them.
@@ -68,7 +69,7 @@ func (mm *MountManager) LoadSaved() error {
 	}
 
 	for _, rec := range mf.Mounts {
-		if err := mm.startWatcher(rec); err != nil {
+		if err := mm.startWatcher(rec, false); err != nil {
 			mm.logger.Warn("failed to restore mount", zap.String("path", rec.LocalPath), zap.Error(err))
 		}
 	}
@@ -76,15 +77,18 @@ func (mm *MountManager) LoadSaved() error {
 }
 
 // Add creates a new mount, starts its watcher, and persists.
-func (mm *MountManager) Add(localPath, remotePrefix string) (ipc.MountRecord, error) {
+// If downloadFirst is true, remote objects are downloaded before the initial upload scan.
+// bucket overrides the default bucket; empty string uses the daemon-configured bucket.
+func (mm *MountManager) Add(localPath, remotePrefix string, downloadFirst bool, bucket string) (ipc.MountRecord, error) {
 	rec := ipc.MountRecord{
 		ID:           randomID(),
 		LocalPath:    localPath,
 		RemotePrefix: remotePrefix,
+		Bucket:       bucket,
 		AddedAt:      time.Now().UTC(),
 	}
 
-	if err := mm.startWatcher(rec); err != nil {
+	if err := mm.startWatcher(rec, downloadFirst); err != nil {
 		return ipc.MountRecord{}, err
 	}
 
@@ -124,12 +128,12 @@ func (mm *MountManager) Remove(localPath string, deleteRemote bool) error {
 	if deleteRemote {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		keys, err := mm.cos.List(ctx, found.record.RemotePrefix)
+		keys, err := found.cos.List(ctx, found.record.RemotePrefix)
 		if err != nil {
 			mm.logger.Warn("list remote for deletion failed", zap.Error(err))
 		} else {
 			for _, k := range keys {
-				if err := mm.cos.Delete(ctx, k); err != nil {
+				if err := found.cos.Delete(ctx, k); err != nil {
 					mm.logger.Warn("delete remote object failed", zap.String("key", k), zap.Error(err))
 				}
 			}
@@ -167,7 +171,26 @@ func (mm *MountManager) StopAll() {
 }
 
 // startWatcher creates and starts a SyncWatcher for the given record.
-func (mm *MountManager) startWatcher(rec ipc.MountRecord) error {
+// If downloadFirst is true, remote files are downloaded before the initial upload scan.
+func (mm *MountManager) startWatcher(rec ipc.MountRecord, downloadFirst bool) error {
+	// Resolve the COSClient for this mount: use a per-mount client when a
+	// bucket override is set, otherwise fall back to the daemon default.
+	mountCOS := mm.cos
+	if rec.Bucket != "" && rec.Bucket != mm.cfg.COS.Bucket {
+		overrideCfg := mm.cfg.COS
+		overrideCfg.Bucket = rec.Bucket
+		// Derive region from the bucket name (format: name-appid, region in config).
+		// We keep the configured region unless the daemon has none.
+		if overrideCfg.Region == "" {
+			overrideCfg.Region = "ap-guangzhou"
+		}
+		var err error
+		mountCOS, err = storage.NewCOSClient(&overrideCfg, mm.metadata, mm.logger)
+		if err != nil {
+			return fmt.Errorf("create cos client for bucket %s: %w", rec.Bucket, err)
+		}
+	}
+
 	ignorePath := filepath.Join(rec.LocalPath, ".syncignore")
 
 	sw, err := watcher.New(
@@ -184,7 +207,7 @@ func (mm *MountManager) startWatcher(rec ipc.MountRecord) error {
 				QPS:             mm.cfg.Performance.QPS,
 			},
 		},
-		mm.cos,
+		mountCOS,
 		mm.metadata,
 		mm.rl,
 		mm.logger,
@@ -198,11 +221,11 @@ func (mm *MountManager) startWatcher(rec ipc.MountRecord) error {
 	}
 
 	mm.mu.Lock()
-	mm.entries[rec.ID] = &watcherEntry{record: rec, watcher: sw}
+	mm.entries[rec.ID] = &watcherEntry{record: rec, watcher: sw, cos: mountCOS}
 	mm.mu.Unlock()
 
 	// Initial full-directory scan in background, with the same filters as the watcher.
-	syncer := storage.NewSyncer(mm.cos, mm.metadata, mm.rl, mm.logger, rec.LocalPath, rec.RemotePrefix)
+	syncer := storage.NewSyncer(mountCOS, mm.metadata, mm.rl, mm.logger, rec.LocalPath, rec.RemotePrefix)
 	ignoreRules, _ := filter.LoadIgnoreRules(ignorePath)
 	swapDetector := filter.NewSwapDetector()
 	syncer.SetIgnoreFunc(func(path string) bool {
@@ -214,6 +237,11 @@ func (mm *MountManager) startWatcher(rec ipc.MountRecord) error {
 	})
 	go func() {
 		ctx := context.Background()
+		if downloadFirst {
+			if err := syncer.DownloadDirectory(ctx); err != nil {
+				mm.logger.Warn("initial download failed", zap.String("path", rec.LocalPath), zap.Error(err))
+			}
+		}
 		if err := syncer.SyncDirectory(ctx); err != nil {
 			mm.logger.Warn("initial sync failed", zap.String("path", rec.LocalPath), zap.Error(err))
 		}

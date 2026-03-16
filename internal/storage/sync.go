@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -92,6 +93,57 @@ func (s *Syncer) syncOne(ctx context.Context, localPath string) {
 
 	s.metadata.SetFileHash(localPath, hash)
 	s.logger.Info("uploaded", zap.String("path", localPath), zap.String("key", remoteKey))
+}
+
+// DownloadDirectory downloads all objects under remotePrefix to localRoot.
+// After downloading each file, it records its hash in the MetadataStore so
+// that the subsequent SyncDirectory scan does not re-upload unchanged files.
+func (s *Syncer) DownloadDirectory(ctx context.Context) error {
+	keys, err := s.cos.List(ctx, s.remotePrefix)
+	if err != nil {
+		return fmt.Errorf("list remote prefix %q: %w", s.remotePrefix, err)
+	}
+
+	prefix := strings.TrimSuffix(s.remotePrefix, "/")
+
+	var wg sync.WaitGroup
+	for _, key := range keys {
+		wg.Add(1)
+		go func(remoteKey string) {
+			defer wg.Done()
+
+			// Derive local path from the remote key
+			rel := remoteKey
+			if prefix != "" {
+				rel = strings.TrimPrefix(remoteKey, prefix+"/")
+			}
+			rel = filepath.FromSlash(rel)
+			localPath := filepath.Join(s.localRoot, rel)
+
+			if err := s.rateLimiter.Acquire(ctx); err != nil {
+				return
+			}
+			defer s.rateLimiter.Release()
+
+			if err := s.cos.Download(ctx, remoteKey, localPath); err != nil {
+				s.logger.Error("download failed",
+					zap.String("key", remoteKey),
+					zap.String("local", localPath),
+					zap.Error(err))
+				return
+			}
+
+			hash, err := HashFile(localPath)
+			if err != nil {
+				s.logger.Warn("hash after download failed", zap.String("path", localPath), zap.Error(err))
+				return
+			}
+			s.metadata.SetFileHash(localPath, hash)
+			s.logger.Info("downloaded", zap.String("key", remoteKey), zap.String("local", localPath))
+		}(key)
+	}
+	wg.Wait()
+	return nil
 }
 
 // SyncDirectory walks localRoot and syncs all files to COS.

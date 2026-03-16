@@ -84,10 +84,14 @@ func (c *Client) ListMounts() ([]ipc.MountRecord, error) {
 }
 
 // AddMount tells the daemon to start watching localPath → remotePrefix.
-func (c *Client) AddMount(localPath, remotePrefix string) (*ipc.MountRecord, error) {
-	body, _ := json.Marshal(map[string]string{
-		"local_path":    localPath,
-		"remote_prefix": remotePrefix,
+// Set downloadFirst=true to pull remote files before the initial upload scan.
+// bucket overrides the default daemon bucket; empty string uses the default.
+func (c *Client) AddMount(localPath, remotePrefix string, downloadFirst bool, bucket string) (*ipc.MountRecord, error) {
+	body, _ := json.Marshal(map[string]interface{}{
+		"local_path":     localPath,
+		"remote_prefix":  remotePrefix,
+		"download_first": downloadFirst,
+		"bucket":         bucket,
 	})
 	resp, err := c.httpClient.Post(c.baseURL+"/mounts", "application/json", bytes.NewReader(body))
 	if err != nil {

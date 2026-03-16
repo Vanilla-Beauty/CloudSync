@@ -12,6 +12,7 @@ type MountRecord struct {
 	ID           string    `json:"id"`
 	LocalPath    string    `json:"local_path"`
 	RemotePrefix string    `json:"remote_prefix"`
+	Bucket       string    `json:"bucket,omitempty"` // empty means daemon default bucket
 	AddedAt      time.Time `json:"added_at"`
 }
 

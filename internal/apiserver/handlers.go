@@ -11,7 +11,7 @@ import (
 
 // MountManagerAPI is the interface the handlers require.
 type MountManagerAPI interface {
-	Add(localPath, remotePrefix string) (ipc.MountRecord, error)
+	Add(localPath, remotePrefix string, downloadFirst bool, bucket string) (ipc.MountRecord, error)
 	Remove(localPath string, deleteRemote bool) error
 	List() []ipc.MountRecord
 	Count() int
@@ -70,8 +70,10 @@ func (h *handlers) listMounts(w http.ResponseWriter, r *http.Request) {
 
 func (h *handlers) addMount(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		LocalPath    string `json:"local_path"`
-		RemotePrefix string `json:"remote_prefix"`
+		LocalPath     string `json:"local_path"`
+		RemotePrefix  string `json:"remote_prefix"`
+		DownloadFirst bool   `json:"download_first"`
+		Bucket        string `json:"bucket"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
@@ -82,7 +84,7 @@ func (h *handlers) addMount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rec, err := h.mm.Add(req.LocalPath, req.RemotePrefix)
+	rec, err := h.mm.Add(req.LocalPath, req.RemotePrefix, req.DownloadFirst, req.Bucket)
 	if err != nil {
 		h.logger.Warn("mount add failed", zap.Error(err))
 		writeError(w, http.StatusInternalServerError, err.Error())
