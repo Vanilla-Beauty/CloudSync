@@ -181,6 +181,60 @@ func (c *COSClient) Download(ctx context.Context, remoteKey, localPath string) e
 	})
 }
 
+// DirEntry represents one entry returned by ListDir.
+type DirEntry struct {
+	Key          string // full key (files only)
+	Prefix       string // full prefix ending with "/" (directories only)
+	Size         int64
+	LastModified string
+	IsDir        bool
+}
+
+// ListDir lists one level under prefix using delimiter="/".
+// Returns subdirectory prefixes and object entries.
+func (c *COSClient) ListDir(ctx context.Context, prefix string) ([]DirEntry, error) {
+	var entries []DirEntry
+	opt := &cos.BucketGetOptions{
+		Prefix:    prefix,
+		Delimiter: "/",
+		MaxKeys:   1000,
+	}
+	for {
+		result, _, err := c.client.Bucket.Get(ctx, opt)
+		if err != nil {
+			return nil, fmt.Errorf("list dir %q: %w", prefix, err)
+		}
+		for _, p := range result.CommonPrefixes {
+			entries = append(entries, DirEntry{Prefix: p, IsDir: true})
+		}
+		for _, obj := range result.Contents {
+			entries = append(entries, DirEntry{
+				Key:          obj.Key,
+				Size:         obj.Size,
+				LastModified: obj.LastModified,
+				IsDir:        false,
+			})
+		}
+		if !result.IsTruncated {
+			break
+		}
+		opt.Marker = result.NextMarker
+	}
+	return entries, nil
+}
+
+// NewCOSClientForBucket creates a temporary COSClient for the given bucket+region
+// without requiring a MetadataStore. Useful for read-only browsing operations.
+func NewCOSClientForBucket(secretID, secretKey, bucket, region string) (*COSClient, error) {
+	cfg := &config.COSConfig{
+		SecretID:  secretID,
+		SecretKey: secretKey,
+		Bucket:    bucket,
+		Region:    region,
+	}
+	return NewCOSClient(cfg, nil, zap.NewNop())
+}
+
 // withRetry runs fn up to maxRetries times with exponential backoff
 func (c *COSClient) withRetry(ctx context.Context, fn func() error) error {
 	var lastErr error

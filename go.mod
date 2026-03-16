@@ -24,4 +24,5 @@ require (
 	github.com/stretchr/testify v1.8.4 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
 	golang.org/x/sys v0.15.0 // indirect
+	golang.org/x/term v0.7.0 // indirect
 )

@@ -43,6 +43,9 @@ func rootCmd() *cobra.Command {
 		unmountCmd(),
 		deleteCmd(),
 		lsCmd(),
+		lsRemoteCmd(),
+		lsBucketCmd(),
+		lsBucketRemoteCmd(),
 	)
 	return root
 }
@@ -533,4 +536,163 @@ func printMountsTable(mounts []ipc.MountRecord) {
 		fmt.Printf("%-10s  %-35s  %-20s  %-30s  %s\n",
 			m.ID, m.LocalPath, m.RemotePrefix, bucket, m.AddedAt.Local().Format(time.RFC3339))
 	}
+}
+
+// ── ls-remote ─────────────────────────────────────────────────────────────────
+
+func lsRemoteCmd() *cobra.Command {
+	var (
+		bucketFlag string
+		prefix     string
+	)
+	cmd := &cobra.Command{
+		Use:   "ls-remote",
+		Short: "Interactively browse a COS bucket (lazygit-style)",
+		Long: `Browse a COS bucket lazily: directories are expanded on demand.
+
+  ↑↓ / j k   navigate
+  Enter / l   expand directory
+  ← / h       collapse directory / go to parent
+  q / Esc     quit`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runLsRemote(bucketFlag, prefix)
+		},
+	}
+	cmd.Flags().StringVar(&bucketFlag, "bucket", "", "Bucket to browse (default: configured default bucket)")
+	cmd.Flags().StringVar(&prefix, "prefix", "", "Start browsing from this prefix")
+	return cmd
+}
+
+func runLsRemote(bucketOverride, prefix string) error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
+	bucket := cfg.COS.Bucket
+	if bucketOverride != "" {
+		bucket = bucketOverride
+	}
+	if bucket == "" {
+		return fmt.Errorf("no bucket specified — use --bucket or run 'cloudsync init' to set a default")
+	}
+
+	// Find the region for this bucket: if it matches the default, use configured
+	// region; otherwise query the service to find it.
+	region := cfg.COS.Region
+	if bucketOverride != "" && bucketOverride != cfg.COS.Bucket {
+		region, err = findBucketRegion(context.Background(), cfg.COS.SecretID, cfg.COS.SecretKey, bucketOverride)
+		if err != nil {
+			return err
+		}
+	}
+
+	cosClient, err := storage.NewCOSClientForBucket(cfg.COS.SecretID, cfg.COS.SecretKey, bucket, region)
+	if err != nil {
+		return err
+	}
+
+	b := newBrowser(cosClient, bucket, prefix)
+	return b.run()
+}
+
+// ── ls-bucket ─────────────────────────────────────────────────────────────────
+
+func lsBucketCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "ls-bucket",
+		Short: "Show configured default bucket and all active mount buckets",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runLsBucket()
+		},
+	}
+}
+
+func runLsBucket() error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Default bucket:  %s  (region: %s)\n\n", cfg.COS.Bucket, cfg.COS.Region)
+
+	// Also show per-mount bucket overrides from the daemon (best-effort)
+	apiClient, apiErr := newClient()
+	if apiErr != nil {
+		fmt.Println("(daemon not running — cannot show per-mount overrides)")
+		return nil
+	}
+	mounts, err := apiClient.ListMounts()
+	if err != nil || len(mounts) == 0 {
+		fmt.Println("No active mounts.")
+		return nil
+	}
+	printMountsTable(mounts)
+	return nil
+}
+
+// ── ls-bucket-remote ──────────────────────────────────────────────────────────
+
+func lsBucketRemoteCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "ls-bucket-remote",
+		Short: "List all COS buckets accessible with the configured credentials",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runLsBucketRemote()
+		},
+	}
+}
+
+func runLsBucketRemote() error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("Fetching bucket list...")
+	buckets, err := storage.ListBuckets(context.Background(), cfg.COS.SecretID, cfg.COS.SecretKey)
+	if err != nil {
+		return fmt.Errorf("list buckets: %w", err)
+	}
+	if len(buckets) == 0 {
+		fmt.Println("No buckets found.")
+		return nil
+	}
+
+	defaultMark := func(name string) string {
+		if name == cfg.COS.Bucket {
+			return " ◀ default"
+		}
+		return ""
+	}
+
+	fmt.Printf("\n%-50s  %s\n", "BUCKET", "REGION")
+	fmt.Println(strings.Repeat("-", 70))
+	for _, b := range buckets {
+		fmt.Printf("%-50s  %s%s\n", b.Name, b.Region, defaultMark(b.Name))
+	}
+	return nil
+}
+
+// ── config helper ─────────────────────────────────────────────────────────────
+
+func loadConfig() (*config.Config, error) {
+	cfgPath, err := ipc.ConfigFilePath()
+	if err != nil {
+		return nil, err
+	}
+	return config.Load(cfgPath)
+}
+
+func findBucketRegion(ctx context.Context, secretID, secretKey, bucket string) (string, error) {
+	buckets, err := storage.ListBuckets(ctx, secretID, secretKey)
+	if err != nil {
+		return "", err
+	}
+	for _, b := range buckets {
+		if b.Name == bucket {
+			return b.Region, nil
+		}
+	}
+	return "", fmt.Errorf("bucket %q not found in your account", bucket)
 }
