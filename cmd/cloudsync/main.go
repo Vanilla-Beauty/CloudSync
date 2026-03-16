@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/cloudsync/cloudsync/internal/apiclient"
@@ -155,12 +154,17 @@ func runStart() error {
 		return nil
 	}
 
-	// Find cloudsyncd binary in same directory as this binary
+	// Find cloudsyncd binary in same directory as this binary.
+	// On Windows the binary has a .exe suffix.
 	selfPath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("find executable: %w", err)
 	}
-	daemonPath := filepath.Join(filepath.Dir(selfPath), "cloudsyncd")
+	daemonName := "cloudsyncd"
+	if strings.HasSuffix(strings.ToLower(selfPath), ".exe") {
+		daemonName = "cloudsyncd.exe"
+	}
+	daemonPath := filepath.Join(filepath.Dir(selfPath), daemonName)
 	if _, err := os.Stat(daemonPath); os.IsNotExist(err) {
 		return fmt.Errorf("cloudsyncd binary not found at %s", daemonPath)
 	}
@@ -215,7 +219,11 @@ func runStop() error {
 	if err != nil {
 		return fmt.Errorf("find executable: %w", err)
 	}
-	daemonPath := filepath.Join(filepath.Dir(selfPath), "cloudsyncd")
+	daemonName := "cloudsyncd"
+	if strings.HasSuffix(strings.ToLower(selfPath), ".exe") {
+		daemonName = "cloudsyncd.exe"
+	}
+	daemonPath := filepath.Join(filepath.Dir(selfPath), daemonName)
 	svcCfg := daemon.BuildServiceConfig(daemonPath)
 	svc, err := service.New(daemon.NewProgram(), svcCfg)
 	if err != nil {
@@ -226,8 +234,8 @@ func runStop() error {
 		return nil
 	}
 
-	// Service manager failed (daemon was started directly, not via systemd).
-	// Fall back to reading the PID file and sending SIGTERM.
+	// Service manager failed (daemon was started directly, not via systemd/SCM).
+	// Fall back to reading the PID file and terminating the process.
 	pidPath, err := ipc.PIDFilePath()
 	if err != nil {
 		return fmt.Errorf("resolve pid file: %w", err)
@@ -244,16 +252,17 @@ func runStop() error {
 	if err != nil {
 		return fmt.Errorf("process not found: %w", err)
 	}
-	if err := proc.Signal(syscall.SIGTERM); err != nil {
-		return fmt.Errorf("send SIGTERM to pid %d: %w", pid, err)
+	if err := ipc.Terminate(proc); err != nil {
+		return fmt.Errorf("terminate pid %d: %w", pid, err)
 	}
 
-	// Wait up to 5 s for the socket to disappear
+	// Wait up to 5 s for daemon to stop (poll via ping).
 	socketPath, _ := ipc.SocketPath()
+	stopClient := apiclient.NewClient(socketPath)
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, err := os.Stat(socketPath); os.IsNotExist(err) {
-			break
+		if stopClient.Ping() != nil {
+			break // daemon no longer responding
 		}
 		time.Sleep(200 * time.Millisecond)
 	}

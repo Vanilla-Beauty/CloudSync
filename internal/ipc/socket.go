@@ -50,8 +50,12 @@ func ConfigDir() (string, error) {
 	return filepath.Join(base, "cloudsync"), nil
 }
 
-// SocketPath returns the Unix Domain Socket path for the daemon.
+// SocketPath returns the IPC path for the daemon.
+// On Windows this is a Named Pipe path; on Unix it is a Unix Domain Socket.
 func SocketPath() (string, error) {
+	if runtime.GOOS == "windows" {
+		return `\\.\pipe\cloudsyncd`, nil
+	}
 	dir, err := ConfigDir()
 	if err != nil {
 		return "", err

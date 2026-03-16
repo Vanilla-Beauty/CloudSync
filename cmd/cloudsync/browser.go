@@ -292,6 +292,9 @@ func visibleLen(s string) int {
 func (b *browser) run() error {
 	ctx := context.Background()
 
+	// Enable ANSI VT escape code processing (required on Windows 10+).
+	enableVTMode()
+
 	// Initial load
 	b.status = "Loading..."
 	if err := b.load(ctx); err != nil {

@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 # install.sh — Build and install cloudsync + cloudsyncd
+# Supports: Linux, macOS
+# For Windows use install.ps1 instead.
 set -euo pipefail
 
 # ── config ────────────────────────────────────────────────────────────────────
 
 BINARIES=(cloudsync cloudsyncd)
-DEFAULT_INSTALL_DIR="/usr/local/bin"
+OS="$(uname -s)"
+
+case "$OS" in
+  Darwin) DEFAULT_INSTALL_DIR="/usr/local/bin" ;;
+  *)      DEFAULT_INSTALL_DIR="/usr/local/bin" ;;
+esac
 
 # ── colors ────────────────────────────────────────────────────────────────────
 
@@ -31,7 +38,7 @@ require_cmd() {
 
 go_version_ok() {
   local ver
-  ver=$(go version | grep -oP 'go\K[0-9]+\.[0-9]+' | head -1)
+  ver=$(go version | grep -oE 'go[0-9]+\.[0-9]+' | head -1 | tr -d 'go')
   local major minor
   IFS='.' read -r major minor <<< "$ver"
   [[ "$major" -gt 1 || ( "$major" -eq 1 && "$minor" -ge 21 ) ]]
@@ -49,6 +56,8 @@ usage() {
   echo "  --dir <path>   Install binaries to <path>  (default: $DEFAULT_INSTALL_DIR)"
   echo "  --gobin        Install to \$(go env GOBIN) or \$GOPATH/bin"
   echo "  -h, --help     Show this help"
+  echo ""
+  echo "OS detected: $OS"
   exit 0
 }
 
@@ -73,15 +82,19 @@ fi
 
 section "Checking prerequisites..."
 
+if [[ "$OS" == "MINGW"* || "$OS" == "MSYS"* || "$OS" == "CYGWIN"* ]]; then
+  error "Detected Windows shell. Please use install.ps1 instead."
+  exit 1
+fi
+
 require_cmd go
 
 if ! go_version_ok; then
   error "Go 1.21+ is required. Current: $(go version)"
   exit 1
 fi
-info "Go $(go version | grep -oP 'go\K[0-9]+\.[0-9.]+')"
+info "Go $(go version | grep -oE 'go[0-9]+\.[0-9.]+' | head -1)"
 
-# Ensure we're in the project root (go.mod must be present)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ ! -f "$SCRIPT_DIR/go.mod" ]]; then
   error "go.mod not found. Run this script from the CloudSync project root."
@@ -91,6 +104,7 @@ cd "$SCRIPT_DIR"
 
 MODULE=$(grep '^module' go.mod | awk '{print $2}')
 info "Module: $MODULE"
+info "OS: $OS"
 
 # ── build ─────────────────────────────────────────────────────────────────────
 
@@ -114,7 +128,6 @@ done
 
 section "Installing to $INSTALL_DIR ..."
 
-# Create install dir if needed (may require sudo)
 if [[ ! -d "$INSTALL_DIR" ]]; then
   if ! mkdir -p "$INSTALL_DIR" 2>/dev/null; then
     warn "Cannot create $INSTALL_DIR, retrying with sudo..."
@@ -122,7 +135,6 @@ if [[ ! -d "$INSTALL_DIR" ]]; then
   fi
 fi
 
-# Determine if we need sudo to write to the install dir
 NEED_SUDO=false
 if [[ ! -w "$INSTALL_DIR" ]]; then
   NEED_SUDO=true
@@ -133,7 +145,6 @@ for bin in "${BINARIES[@]}"; do
   echo -n "  Installing $bin ... "
   src="$BUILD_DIR/$bin"
   dst="$INSTALL_DIR/$bin"
-
   if $NEED_SUDO; then
     sudo install -m 755 "$src" "$dst"
   else
@@ -156,14 +167,13 @@ for bin in "${BINARIES[@]}"; do
   fi
 done
 
-# Warn if install dir is not in PATH
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
   warn "$INSTALL_DIR is not in your PATH."
   warn "Add this to your shell profile:"
   warn "  export PATH=\"$INSTALL_DIR:\$PATH\""
 fi
 
-# ── done ──────────────────────────────────────────────────────────────────────
+# ── autostart hint ────────────────────────────────────────────────────────────
 
 echo ""
 info "Installation complete!"
@@ -173,3 +183,16 @@ echo "    cloudsync init          # configure COS credentials"
 echo "    cloudsync start         # start the daemon"
 echo "    cloudsync mount <path>  # start syncing a directory"
 echo ""
+
+case "$OS" in
+  Linux)
+    echo "  To start cloudsyncd automatically on login:"
+    echo "    ./enable-autostart.sh"
+    echo ""
+    ;;
+  Darwin)
+    echo "  To start cloudsyncd automatically at login:"
+    echo "    ./enable-autostart.sh"
+    echo ""
+    ;;
+esac

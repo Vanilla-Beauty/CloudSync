@@ -5,7 +5,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 
+	"github.com/cloudsync/cloudsync/internal/ipc"
 	"go.uber.org/zap"
 )
 
@@ -24,10 +26,13 @@ func NewServer(mm MountManagerAPI, logger *zap.Logger) *Server {
 
 // Start removes any stale socket, listens, and serves in a goroutine.
 func (s *Server) Start(socketPath string) error {
-	// Clean up stale socket from previous crash
-	_ = os.Remove(socketPath)
+	// On Unix, clean up stale socket from previous crash.
+	// On Windows (Named Pipe) os.Remove is a no-op on a non-existent pipe.
+	if runtime.GOOS != "windows" {
+		_ = os.Remove(socketPath)
+	}
 
-	ln, err := net.Listen("unix", socketPath)
+	ln, err := ipc.Listen(socketPath)
 	if err != nil {
 		return err
 	}

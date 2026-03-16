@@ -22,7 +22,7 @@ type Client struct {
 func NewClient(socketPath string) *Client {
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+			return ipc.Dial(ctx, socketPath)
 		},
 	}
 	return &Client{
