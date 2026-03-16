@@ -501,7 +501,7 @@ func runDelete(path string) error {
 func lsCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "ls",
-		Short: "List active mounts",
+		Short: "Interactively browse active local mounts (TUI)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runLs()
 		},
@@ -521,8 +521,52 @@ func runLs() error {
 		fmt.Println("No active mounts.")
 		return nil
 	}
-	printMountsTable(mounts)
-	return nil
+
+	b := newMountBrowser(client, mounts)
+	for {
+		rec, err := b.run()
+		if err != nil {
+			return err
+		}
+		if rec == nil {
+			// User quit
+			return nil
+		}
+		// User pressed 'r' — open remote browser for this mount.
+		cfg, cfgErr := loadConfig()
+		if cfgErr != nil {
+			b.status = "Config error: " + cfgErr.Error()
+			continue
+		}
+		bucket := rec.Bucket
+		if bucket == "" {
+			bucket = cfg.COS.Bucket
+		}
+		region := cfg.COS.Region
+		if bucket != cfg.COS.Bucket {
+			region, err = findBucketRegion(context.Background(), cfg.COS.SecretID, cfg.COS.SecretKey, bucket)
+			if err != nil {
+				b.status = "Region error: " + err.Error()
+				continue
+			}
+		}
+		cosClient, cosErr := storage.NewCOSClientForBucket(cfg.COS.SecretID, cfg.COS.SecretKey, bucket, region)
+		if cosErr != nil {
+			b.status = "COS error: " + cosErr.Error()
+			continue
+		}
+		rb := newBrowser(cosClient, bucket, rec.RemotePrefix, client)
+		if runErr := rb.run(); runErr != nil {
+			b.status = "Browse error: " + runErr.Error()
+		}
+		// After remote browse closes, refresh mounts and return to mount browser
+		newMounts, listErr := client.ListMounts()
+		if listErr == nil {
+			b.mounts = newMounts
+			b.clampCursor()
+		}
+		b.status = ""
+	}
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -618,7 +662,7 @@ func runLsRemote(bucketOverride, prefix string) error {
 func lsBucketCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "ls-bucket",
-		Short: "Show configured default bucket and all active mount buckets",
+		Short: "Show configured default bucket and per-mount bucket overrides",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runLsBucket()
 		},
@@ -631,20 +675,39 @@ func runLsBucket() error {
 		return err
 	}
 
-	fmt.Printf("Default bucket:  %s  (region: %s)\n\n", cfg.COS.Bucket, cfg.COS.Region)
+	fmt.Printf("Default bucket:  %s\n", cfg.COS.Bucket)
+	fmt.Printf("Region:          %s\n", cfg.COS.Region)
 
-	// Also show per-mount bucket overrides from the daemon (best-effort)
+	// Show per-mount bucket overrides (best-effort, daemon may not be running)
 	apiClient, apiErr := newClient()
 	if apiErr != nil {
-		fmt.Println("(daemon not running — cannot show per-mount overrides)")
+		fmt.Println("\n(daemon not running — cannot show per-mount overrides)")
 		return nil
 	}
 	mounts, err := apiClient.ListMounts()
-	if err != nil || len(mounts) == 0 {
-		fmt.Println("No active mounts.")
+	if err != nil {
+		fmt.Println("\n(could not list mounts:", err, ")")
 		return nil
 	}
-	printMountsTable(mounts)
+
+	// Collect only mounts that override the default bucket
+	var overrides []ipc.MountRecord
+	for _, m := range mounts {
+		if m.Bucket != "" && m.Bucket != cfg.COS.Bucket {
+			overrides = append(overrides, m)
+		}
+	}
+	if len(overrides) == 0 {
+		fmt.Println("\nNo per-mount bucket overrides.")
+		return nil
+	}
+
+	fmt.Printf("\nPer-mount bucket overrides (%d):\n", len(overrides))
+	fmt.Printf("%-10s  %-35s  %s\n", "ID", "LOCAL PATH", "BUCKET")
+	fmt.Println(strings.Repeat("-", 70))
+	for _, m := range overrides {
+		fmt.Printf("%-10s  %-35s  %s\n", m.ID, m.LocalPath, m.Bucket)
+	}
 	return nil
 }
 
