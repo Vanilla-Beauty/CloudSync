@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -161,6 +162,55 @@ func (mm *MountManager) Count() int {
 	return len(mm.entries)
 }
 
+// DeleteObjects asynchronously deletes all COS objects under remotePrefix.
+// It also removes the corresponding local files if a mount covers that prefix.
+// The call returns immediately; deletion happens in a background goroutine.
+func (mm *MountManager) DeleteObjects(remotePrefix string) {
+	// Find the entry whose RemotePrefix matches, to get the right COSClient.
+	mm.mu.RLock()
+	var matchCOS *storage.COSClient
+	var localDir string
+	for _, e := range mm.entries {
+		if e.record.RemotePrefix == remotePrefix ||
+			strings.HasPrefix(remotePrefix, e.record.RemotePrefix) {
+			matchCOS = e.cos
+			rel := strings.TrimPrefix(remotePrefix, e.record.RemotePrefix)
+			localDir = filepath.Join(e.record.LocalPath, filepath.FromSlash(rel))
+			break
+		}
+	}
+	mm.mu.RUnlock()
+
+	cosClient := matchCOS
+	if cosClient == nil {
+		cosClient = mm.cos // fall back to default
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+
+		keys, err := cosClient.List(ctx, remotePrefix)
+		if err != nil {
+			mm.logger.Warn("DeleteObjects: list failed",
+				zap.String("prefix", remotePrefix), zap.Error(err))
+			return
+		}
+		for _, k := range keys {
+			if err := cosClient.Delete(ctx, k); err != nil {
+				mm.logger.Warn("DeleteObjects: delete failed",
+					zap.String("key", k), zap.Error(err))
+			}
+		}
+		// Best-effort: remove local files if this prefix is under a mount.
+		if localDir != "" {
+			_ = os.RemoveAll(localDir)
+		}
+		mm.logger.Info("DeleteObjects: complete",
+			zap.String("prefix", remotePrefix), zap.Int("count", len(keys)))
+	}()
+}
+
 // StopAll stops all watchers (called on daemon shutdown).
 func (mm *MountManager) StopAll() {
 	mm.mu.Lock()
@@ -173,6 +223,12 @@ func (mm *MountManager) StopAll() {
 // startWatcher creates and starts a SyncWatcher for the given record.
 // If downloadFirst is true, remote files are downloaded before the initial upload scan.
 func (mm *MountManager) startWatcher(rec ipc.MountRecord, downloadFirst bool) error {
+	// Ensure the local directory exists. This allows AddMount to be called
+	// for a path that does not yet exist (e.g. from the TUI browser).
+	if err := os.MkdirAll(rec.LocalPath, 0755); err != nil {
+		return fmt.Errorf("create local path %s: %w", rec.LocalPath, err)
+	}
+
 	// Resolve the COSClient for this mount: use a per-mount client when a
 	// bucket override is set, otherwise fall back to the daemon default.
 	mountCOS := mm.cos

@@ -134,3 +134,22 @@ func (c *Client) RemoveMount(localPath string, deleteRemote bool) error {
 	}
 	return nil
 }
+
+// DeleteObjects asks the daemon to asynchronously delete all COS objects under
+// remotePrefix. The daemon also removes corresponding local files if they fall
+// under a known mount. The call returns as soon as the daemon has accepted the
+// request (HTTP 202); actual deletion happens in the daemon's background.
+func (c *Client) DeleteObjects(remotePrefix string) error {
+	body, _ := json.Marshal(map[string]string{"remote_prefix": remotePrefix})
+	resp, err := c.httpClient.Post(c.baseURL+"/objects/delete", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("daemon is not running — use 'cloudsync start'")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		var e map[string]string
+		_ = json.NewDecoder(resp.Body).Decode(&e)
+		return fmt.Errorf("delete objects failed: %s", e["error"])
+	}
+	return nil
+}

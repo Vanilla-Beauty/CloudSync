@@ -15,6 +15,7 @@ type MountManagerAPI interface {
 	Remove(localPath string, deleteRemote bool) error
 	List() []ipc.MountRecord
 	Count() int
+	DeleteObjects(remotePrefix string)
 }
 
 type handlers struct {
@@ -113,4 +114,25 @@ func (h *handlers) removeMount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// POST /objects/delete — fire-and-forget deletion of a COS prefix or key.
+func (h *handlers) deleteObjects(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		RemotePrefix string `json:"remote_prefix"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if req.RemotePrefix == "" {
+		writeError(w, http.StatusBadRequest, "remote_prefix is required")
+		return
+	}
+	h.mm.DeleteObjects(req.RemotePrefix)
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
 }

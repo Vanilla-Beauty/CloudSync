@@ -278,67 +278,44 @@ func removeFromSlice(nodes []*node, target *node) []*node {
 	return out
 }
 
-// executeDelete performs the actual deletion of pendingNode.
+// executeDelete delegates deletion to the daemon via DeleteObjects.
+// The daemon handles all COS and local-file I/O asynchronously.
 func (b *browser) executeDelete() {
 	n := b.pendingNode
+	b.pendingNode = nil
+	b.mode = modeNormal
+
 	if n == nil {
-		b.mode = modeNormal
 		return
 	}
-	ctx := context.Background()
 
-	if n.entry.IsDir {
-		// Directory delete: list all keys then delete each.
-		b.mode = modeBusy
-		b.status = "Deleting..."
-		b.render()
-
-		prefix := n.entry.Prefix
-		keys, err := b.cos.List(ctx, prefix)
-		if err != nil {
-			b.status = "Error: " + err.Error()
-			b.mode = modeNormal
-			b.pendingNode = nil
-			return
-		}
-		var delErr error
-		for _, key := range keys {
-			if err := b.cos.Delete(ctx, key); err != nil {
-				delErr = err
-				break
-			}
-		}
-		if delErr != nil {
-			b.status = "Error: " + delErr.Error()
-			b.mode = modeNormal
-			b.pendingNode = nil
-			return
-		}
-		// Best-effort local cleanup if mounted.
-		if localDir, ok := b.localPathForKey(prefix); ok {
-			_ = os.RemoveAll(localDir)
-		}
-		b.removeNodeFromTree(n)
-		b.status = "Deleted prefix: " + prefix
-	} else {
-		// Single file delete.
-		key := n.entry.Key
-		if err := b.cos.Delete(ctx, key); err != nil {
-			b.status = "Error: " + err.Error()
-			b.mode = modeNormal
-			b.pendingNode = nil
-			return
-		}
-		// Best-effort local cleanup if mounted.
-		if localFile, ok := b.localPathForKey(key); ok {
-			_ = os.Remove(localFile)
-		}
-		b.removeNodeFromTree(n)
-		b.status = "Deleted: " + key
+	if b.apiClient == nil {
+		b.status = "Error: daemon not running"
+		return
 	}
 
-	b.mode = modeNormal
-	b.pendingNode = nil
+	var remoteKey string
+	if n.entry.IsDir {
+		remoteKey = n.entry.Prefix
+	} else {
+		remoteKey = n.entry.Key
+	}
+
+	// Fire-and-forget: send the request to the daemon and return immediately.
+	// Remove the node from the tree optimistically; the status bar confirms.
+	go func() {
+		err := b.apiClient.DeleteObjects(remoteKey)
+		var msg string
+		if err != nil {
+			msg = "Delete error: " + err.Error()
+		} else {
+			msg = "Deleting (background): " + remoteKey
+		}
+		b.bgResult <- msg
+	}()
+
+	b.removeNodeFromTree(n)
+	b.status = "Deleting (background): " + remoteKey
 }
 
 // enterSyncMode validates the selection and switches to modeSyncInput.
@@ -361,8 +338,9 @@ func (b *browser) enterSyncMode() {
 	b.mode = modeSyncInput
 }
 
-// executeSync calls AddMount in a background goroutine so the TUI stays responsive.
-// The result is delivered via b.bgResult and picked up by run().
+// executeSync calls AddMount via the daemon in a background goroutine.
+// The daemon creates the local directory and pulls remote files before
+// starting the watcher — no filesystem or COS I/O happens in the TUI process.
 func (b *browser) executeSync() {
 	localPath := strings.TrimSpace(string(b.inputBuf))
 	if localPath == "" {
@@ -382,12 +360,14 @@ func (b *browser) executeSync() {
 	b.status = "Syncing " + prefix + " → " + localPath + " (background…)"
 
 	go func() {
-		_, err := b.apiClient.AddMount(localPath, prefix, false, "")
+		// downloadFirst=true: daemon pulls existing remote files before the
+		// upload watcher starts. Directory creation is also handled by the daemon.
+		_, err := b.apiClient.AddMount(localPath, prefix, true, "")
 		var msg string
 		if err != nil {
 			msg = "Sync error: " + err.Error()
 		} else {
-			msg = "Syncing: " + localPath + " → " + prefix
+			msg = "Syncing: " + localPath + " ↔ " + prefix
 		}
 		b.bgResult <- msg
 	}()
