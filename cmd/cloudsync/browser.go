@@ -85,8 +85,11 @@ type browser struct {
 	inputPrompt string // full prompt string for render
 
 	// daemon integration
-	apiClient *apiclient.Client  // nil = daemon not running
-	mounts    []ipc.MountRecord  // loaded once at startup
+	apiClient *apiclient.Client // nil = daemon not running
+	mounts    []ipc.MountRecord // loaded once at startup
+
+	// background operation results (buffered size 1; sender never blocks)
+	bgResult chan string
 }
 
 func newBrowser(cos *storage.COSClient, bucket, prefix string, apiClient *apiclient.Client) *browser {
@@ -95,6 +98,7 @@ func newBrowser(cos *storage.COSClient, bucket, prefix string, apiClient *apicli
 		bucket:    bucket,
 		prefix:    prefix,
 		apiClient: apiClient,
+		bgResult:  make(chan string, 1),
 	}
 	// Best-effort: load mounts at startup. Failure is silently ignored.
 	if apiClient != nil {
@@ -357,26 +361,36 @@ func (b *browser) enterSyncMode() {
 	b.mode = modeSyncInput
 }
 
-// executeSync calls AddMount with the user-supplied (or default) local path.
+// executeSync calls AddMount in a background goroutine so the TUI stays responsive.
+// The result is delivered via b.bgResult and picked up by run().
 func (b *browser) executeSync() {
 	localPath := strings.TrimSpace(string(b.inputBuf))
 	if localPath == "" {
 		localPath = b.defaultPath
 	}
 	n := b.pendingNode
-	if n == nil {
-		b.mode = modeNormal
-		return
-	}
-	_, err := b.apiClient.AddMount(localPath, n.entry.Prefix, false, "")
-	if err != nil {
-		b.status = "Error: " + err.Error()
-	} else {
-		b.status = "Syncing: " + localPath + " → " + n.entry.Prefix
-	}
+
 	b.inputBuf = b.inputBuf[:0]
 	b.pendingNode = nil
 	b.mode = modeNormal
+
+	if n == nil {
+		return
+	}
+
+	prefix := n.entry.Prefix
+	b.status = "Syncing " + prefix + " → " + localPath + " (background…)"
+
+	go func() {
+		_, err := b.apiClient.AddMount(localPath, prefix, false, "")
+		var msg string
+		if err != nil {
+			msg = "Sync error: " + err.Error()
+		} else {
+			msg = "Syncing: " + localPath + " → " + prefix
+		}
+		b.bgResult <- msg
+	}()
 }
 
 // ── rendering ────────────────────────────────────────────────────────────────
@@ -563,78 +577,104 @@ func (b *browser) run() error {
 
 	b.render()
 
-	buf := make([]byte, 8)
-	for {
+	type keyMsg struct {
+		data []byte
+		err  error
+	}
+	keyCh := make(chan keyMsg, 1)
+
+	// Read stdin in a dedicated goroutine so the main loop can also select on
+	// bgResult (background AddMount completions) without blocking.
+	readNext := func() {
+		buf := make([]byte, 8)
 		n, err := os.Stdin.Read(buf)
 		if err != nil {
-			return nil
+			keyCh <- keyMsg{err: err}
+			return
 		}
+		keyCh <- keyMsg{data: buf[:n]}
+	}
+	go readNext()
 
-		// In modeBusy: discard all input and just re-render
-		if b.mode == modeBusy {
-			b.render()
-			continue
-		}
-
-		key := buf[:n]
-
-		switch b.mode {
-		case modeDeleteConfirm:
-			switch {
-			case isKey(key, 'd'):
-				b.executeDelete()
-			case isKey(key, 27), isKey(key, 'q'): // Esc or q = cancel
-				b.pendingNode = nil
-				b.mode = modeNormal
-				b.status = "Cancelled"
-			}
-
-		case modeSyncInput:
-			switch {
-			case isKey(key, 13): // Enter
-				b.executeSync()
-			case isKey(key, 27): // Esc = cancel
-				b.inputBuf = b.inputBuf[:0]
-				b.pendingNode = nil
-				b.mode = modeNormal
-				b.status = "Cancelled"
-			case isKey(key, 127), isKey(key, 8): // Backspace / DEL
-				if len(b.inputBuf) > 0 {
-					b.inputBuf = b.inputBuf[:len(b.inputBuf)-1]
-				}
-			default:
-				// Accept printable ASCII
-				if len(key) == 1 && key[0] >= 32 {
-					b.inputBuf = append(b.inputBuf, rune(key[0]))
-				}
-			}
-
-		default: // modeNormal
-			switch {
-			case isKey(key, 'q'), isKey(key, 27): // q or Esc → quit
+	for {
+		select {
+		case msg := <-keyCh:
+			if msg.err != nil {
 				return nil
-			case isKey(key, 'j'), isEscape(key, 'B'): // down / ↓
-				b.moveDown()
-			case isKey(key, 'k'), isEscape(key, 'A'): // up / ↑
-				b.moveUp()
-			case isKey(key, 13), isKey(key, ' '): // Enter / Space → expand
-				b.expand(ctx)
-			case isKey(key, 'h'), isEscape(key, 'D'): // h / ← → collapse
-				b.collapse()
-			case isKey(key, 'l'), isEscape(key, 'C'): // l / → → same as Enter
-				b.expand(ctx)
-			case isKey(key, 'd'): // d → delete
-				if sel := b.selectedNode(); sel != nil {
-					b.pendingNode = sel
-					b.mode = modeDeleteConfirm
-					b.status = ""
-				}
-			case isKey(key, 's'): // s → sync
-				b.enterSyncMode()
 			}
-		}
 
-		b.render()
+			// In modeBusy: discard all input and just re-render
+			if b.mode == modeBusy {
+				b.render()
+				go readNext()
+				continue
+			}
+
+			key := msg.data
+
+			switch b.mode {
+			case modeDeleteConfirm:
+				switch {
+				case isKey(key, 'd'):
+					b.executeDelete()
+				case isKey(key, 27), isKey(key, 'q'): // Esc or q = cancel
+					b.pendingNode = nil
+					b.mode = modeNormal
+					b.status = "Cancelled"
+				}
+
+			case modeSyncInput:
+				switch {
+				case isKey(key, 13): // Enter
+					b.executeSync()
+				case isKey(key, 27): // Esc = cancel
+					b.inputBuf = b.inputBuf[:0]
+					b.pendingNode = nil
+					b.mode = modeNormal
+					b.status = "Cancelled"
+				case isKey(key, 127), isKey(key, 8): // Backspace / DEL
+					if len(b.inputBuf) > 0 {
+						b.inputBuf = b.inputBuf[:len(b.inputBuf)-1]
+					}
+				default:
+					// Accept printable ASCII
+					if len(key) == 1 && key[0] >= 32 {
+						b.inputBuf = append(b.inputBuf, rune(key[0]))
+					}
+				}
+
+			default: // modeNormal
+				switch {
+				case isKey(key, 'q'), isKey(key, 27): // q or Esc → quit
+					return nil
+				case isKey(key, 'j'), isEscape(key, 'B'): // down / ↓
+					b.moveDown()
+				case isKey(key, 'k'), isEscape(key, 'A'): // up / ↑
+					b.moveUp()
+				case isKey(key, 13), isKey(key, ' '): // Enter / Space → expand
+					b.expand(ctx)
+				case isKey(key, 'h'), isEscape(key, 'D'): // h / ← → collapse
+					b.collapse()
+				case isKey(key, 'l'), isEscape(key, 'C'): // l / → → same as Enter
+					b.expand(ctx)
+				case isKey(key, 'd'): // d → delete
+					if sel := b.selectedNode(); sel != nil {
+						b.pendingNode = sel
+						b.mode = modeDeleteConfirm
+						b.status = ""
+					}
+				case isKey(key, 's'): // s → sync
+					b.enterSyncMode()
+				}
+			}
+
+			b.render()
+			go readNext()
+
+		case msg := <-b.bgResult:
+			b.status = msg
+			b.render()
+		}
 	}
 }
 
