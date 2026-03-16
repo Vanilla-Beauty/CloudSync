@@ -103,23 +103,6 @@ func (b *mountBrowser) executeUnmount() {
 
 // ── rendering ─────────────────────────────────────────────────────────────────
 
-const (
-	mbColorReset  = "\033[0m"
-	mbColorBold   = "\033[1m"
-	mbColorHiLine = "\033[7m"
-	mbColorGray   = "\033[90m"
-	mbColorYellow = "\033[33m"
-	mbColorGreen  = "\033[32m"
-	mbClearLine   = "\033[2K"
-	mbClearScreen = "\033[2J\033[H"
-	mbHideCursor  = "\033[?25l"
-	mbShowCursor  = "\033[?25h"
-)
-
-func mbMoveTo(row, col int) string {
-	return fmt.Sprintf("\033[%d;%dH", row, col)
-}
-
 func (b *mountBrowser) render() {
 	w, h, err := term.GetSize(int(os.Stdout.Fd()))
 	if err != nil {
@@ -137,15 +120,15 @@ func (b *mountBrowser) render() {
 	}
 
 	var sb strings.Builder
-	sb.WriteString(mbHideCursor)
-	sb.WriteString(mbClearScreen)
+	sb.WriteString(ansiHideCursor)
+	sb.WriteString(ansiClearScreen)
 
 	// Title bar
 	title := fmt.Sprintf(" CloudSync Mounts  (%d active)", len(b.mounts))
-	sb.WriteString(mbMoveTo(1, 1))
-	sb.WriteString(mbColorBold)
-	mbPadRight(&sb, title, w)
-	sb.WriteString(mbColorReset)
+	sb.WriteString(ansiMoveTo(1, 1))
+	sb.WriteString(ansiBold)
+	padRight(&sb, title, w)
+	sb.WriteString(ansiReset)
 
 	// Content rows — two lines per mount entry
 	rowsPerEntry := 2
@@ -175,95 +158,64 @@ func (b *mountBrowser) render() {
 		line1 := fmt.Sprintf("  %-42s → %-26s", truncateStr(m.LocalPath, 42), truncateStr(m.RemotePrefix, 26))
 		line2 := fmt.Sprintf("    bucket: %-28s  id: %-10s  added: %s", bucketStr, m.ID, addedStr)
 
-		sb.WriteString(mbMoveTo(screenRow, 1))
+		sb.WriteString(ansiMoveTo(screenRow, 1))
 		if selected {
-			sb.WriteString(mbColorHiLine)
+			sb.WriteString(ansiSelected)
 		} else {
-			sb.WriteString(mbColorGreen)
+			sb.WriteString(ansiMountRow)
 		}
-		mbPadRight(&sb, line1, w)
-		sb.WriteString(mbColorReset)
+		padRight(&sb, line1, w)
+		sb.WriteString(ansiReset)
 
 		screenRow++
 		if screenRow >= h-1 {
 			break
 		}
 
-		sb.WriteString(mbMoveTo(screenRow, 1))
+		sb.WriteString(ansiMoveTo(screenRow, 1))
 		if selected {
-			sb.WriteString(mbColorHiLine)
+			sb.WriteString(ansiSelected)
 		} else {
-			sb.WriteString(mbColorGray)
+			sb.WriteString(ansiMeta)
 		}
-		mbPadRight(&sb, line2, w)
-		sb.WriteString(mbColorReset)
+		padRight(&sb, line2, w)
+		sb.WriteString(ansiReset)
 
 		screenRow++
 	}
 
 	// Clear remaining rows
 	for screenRow < h-1 {
-		sb.WriteString(mbMoveTo(screenRow, 1))
-		sb.WriteString(mbClearLine)
+		sb.WriteString(ansiMoveTo(screenRow, 1))
+		sb.WriteString(ansiClearLine)
 		screenRow++
 	}
 
 	// Separator
-	sb.WriteString(mbMoveTo(h-1, 1))
-	sb.WriteString(mbColorGray)
+	sb.WriteString(ansiMoveTo(h-1, 1))
+	sb.WriteString(ansiSeparator)
 	sb.WriteString(strings.Repeat("─", w))
-	sb.WriteString(mbColorReset)
+	sb.WriteString(ansiReset)
 
 	// Status / help bar
-	sb.WriteString(mbMoveTo(h, 1))
+	sb.WriteString(ansiMoveTo(h, 1))
 	switch b.mode {
 	case mbModeUnmountConfirm:
 		name := ""
 		if b.pendingIdx >= 0 && b.pendingIdx < len(b.mounts) {
 			name = b.mounts[b.pendingIdx].LocalPath
 		}
-		line := mbColorYellow + " Unmount \"" + name + "\"? Press u to confirm, Esc to cancel" + mbColorReset
+		line := ansiWarning + " Unmount \"" + name + "\"? Press u to confirm, Esc to cancel" + ansiReset
 		sb.WriteString(line)
 	default:
 		help := " ↑↓/jk move   u unmount   r browse remote   q quit"
 		if b.status != "" {
-			help = mbColorYellow + " " + b.status + mbColorReset
+			help = ansiWarning + " " + b.status + ansiReset
 		}
 		sb.WriteString(help)
 	}
 
 	fmt.Fprint(os.Stdout, sb.String())
-}
-
-func mbPadRight(sb *strings.Builder, s string, w int) {
-	visible := mbVisibleLen(s)
-	if visible > w {
-		sb.WriteString(s[:w])
-	} else {
-		sb.WriteString(s)
-		for i := visible; i < w; i++ {
-			sb.WriteByte(' ')
-		}
-	}
-}
-
-func mbVisibleLen(s string) int {
-	n := 0
-	inEsc := false
-	for _, c := range s {
-		if inEsc {
-			if c == 'm' {
-				inEsc = false
-			}
-			continue
-		}
-		if c == '\033' {
-			inEsc = true
-			continue
-		}
-		n++
-	}
-	return n
 }
 
 func truncateStr(s string, max int) string {
@@ -294,7 +246,7 @@ func (b *mountBrowser) run() (*ipc.MountRecord, error) {
 	}
 	defer func() {
 		_ = term.Restore(fd, oldState)
-		fmt.Print(mbShowCursor)
+		fmt.Print(ansiShowCursor)
 	}()
 
 	b.render()

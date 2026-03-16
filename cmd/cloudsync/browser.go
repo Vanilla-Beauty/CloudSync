@@ -375,24 +375,6 @@ func (b *browser) executeSync() {
 
 // ── rendering ────────────────────────────────────────────────────────────────
 
-const (
-	colorReset  = "\033[0m"
-	colorBold   = "\033[1m"
-	colorHiLine = "\033[7m" // reverse video for selected row
-	colorDir    = "\033[34m" // blue
-	colorGray   = "\033[90m"
-	colorYellow = "\033[33m"
-
-	clearLine   = "\033[2K"
-	clearScreen = "\033[2J\033[H"
-	hideCursor  = "\033[?25l"
-	showCursor  = "\033[?25h"
-)
-
-func moveTo(row, col int) string {
-	return fmt.Sprintf("\033[%d;%dH", row, col)
-}
-
 func (b *browser) render() {
 	w, h, err := term.GetSize(int(os.Stdout.Fd()))
 	if err != nil {
@@ -410,22 +392,22 @@ func (b *browser) render() {
 	}
 
 	var sb strings.Builder
-	sb.WriteString(hideCursor)
-	sb.WriteString(clearScreen)
+	sb.WriteString(ansiHideCursor)
+	sb.WriteString(ansiClearScreen)
 
 	// Title bar
 	title := fmt.Sprintf(" COS  %s%s  (%d items)", b.bucket, "/"+b.prefix, len(b.flat))
-	sb.WriteString(moveTo(1, 1))
-	sb.WriteString(colorBold)
+	sb.WriteString(ansiMoveTo(1, 1))
+	sb.WriteString(ansiBold)
 	padRight(&sb, title, w)
-	sb.WriteString(colorReset)
+	sb.WriteString(ansiReset)
 
 	// Content rows
 	for row := 0; row < b.height; row++ {
 		idx := b.offset + row
-		sb.WriteString(moveTo(row+2, 1))
+		sb.WriteString(ansiMoveTo(row+2, 1))
 		if idx >= len(b.flat) {
-			sb.WriteString(clearLine)
+			sb.WriteString(ansiClearLine)
 			continue
 		}
 		n := b.flat[idx]
@@ -435,26 +417,26 @@ func (b *browser) render() {
 		lbl := indent + n.label()
 
 		if selected {
-			sb.WriteString(colorHiLine)
+			sb.WriteString(ansiSelected)
 		} else if n.entry.IsDir {
-			sb.WriteString(colorDir)
+			sb.WriteString(ansiDirColor)
 		}
 
 		padRight(&sb, lbl, w)
 
 		if selected || n.entry.IsDir {
-			sb.WriteString(colorReset)
+			sb.WriteString(ansiReset)
 		}
 	}
 
 	// Separator
-	sb.WriteString(moveTo(h-1, 1))
-	sb.WriteString(colorGray)
+	sb.WriteString(ansiMoveTo(h-1, 1))
+	sb.WriteString(ansiSeparator)
 	sb.WriteString(strings.Repeat("─", w))
-	sb.WriteString(colorReset)
+	sb.WriteString(ansiReset)
 
 	// Status / help bar (last line) — content depends on mode
-	sb.WriteString(moveTo(h, 1))
+	sb.WriteString(ansiMoveTo(h, 1))
 	switch b.mode {
 	case modeDeleteConfirm:
 		name := ""
@@ -465,7 +447,7 @@ func (b *browser) render() {
 				name = fileName(b.pendingNode.entry.Key)
 			}
 		}
-		line := colorYellow + " Delete \"" + name + "\"? Press d to confirm, Esc to cancel" + colorReset
+		line := ansiWarning + " Delete \"" + name + "\"? Press d to confirm, Esc to cancel" + ansiReset
 		sb.WriteString(line)
 
 	case modeSyncInput:
@@ -482,51 +464,17 @@ func (b *browser) render() {
 		sb.WriteString(line)
 
 	case modeBusy:
-		sb.WriteString(colorYellow + " " + b.status + colorReset)
+		sb.WriteString(ansiWarning + " " + b.status + ansiReset)
 
 	default: // modeNormal
 		help := " ↑↓/jk move   Enter expand   ←/h collapse   d delete   s sync   q quit"
 		if b.status != "" {
-			help = colorYellow + " " + b.status + colorReset
+			help = ansiWarning + " " + b.status + ansiReset
 		}
 		sb.WriteString(help)
 	}
 
 	fmt.Fprint(os.Stdout, sb.String())
-}
-
-func padRight(sb *strings.Builder, s string, w int) {
-	// Strip ANSI for length calculation — simple visual truncate
-	visible := visibleLen(s)
-	if visible > w {
-		// Truncate to w visible chars (approximate)
-		sb.WriteString(s[:w])
-	} else {
-		sb.WriteString(s)
-		for i := visible; i < w; i++ {
-			sb.WriteByte(' ')
-		}
-	}
-}
-
-// visibleLen returns the number of visible (non-ANSI) characters.
-func visibleLen(s string) int {
-	n := 0
-	inEsc := false
-	for _, c := range s {
-		if inEsc {
-			if c == 'm' {
-				inEsc = false
-			}
-			continue
-		}
-		if c == '\033' {
-			inEsc = true
-			continue
-		}
-		n++
-	}
-	return n
 }
 
 // ── run ──────────────────────────────────────────────────────────────────────
@@ -552,7 +500,7 @@ func (b *browser) run() error {
 	}
 	defer func() {
 		_ = term.Restore(fd, oldState)
-		fmt.Print(showCursor)
+		fmt.Print(ansiShowCursor)
 	}()
 
 	b.render()
