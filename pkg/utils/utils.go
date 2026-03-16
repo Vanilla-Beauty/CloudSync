@@ -3,6 +3,7 @@ package utils
 import (
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // FileExists returns true if path exists and is not a directory
@@ -35,6 +36,19 @@ func RelPath(base, target string) (string, error) {
 		return "", err
 	}
 	return filepath.ToSlash(rel), nil
+}
+
+// NormalizeRemotePrefix converts a user-supplied remote prefix to a canonical
+// forward-slash form ending with exactly one "/".
+// It converts OS path separators (e.g. Windows backslashes) and strips any
+// trailing slashes before appending the final "/".
+//
+//	"working"   → "working/"
+//	"working/"  → "working/"
+//	"working\"  → "working/"    (Windows input)
+//	"a/b/c/"   → "a/b/c/"
+func NormalizeRemotePrefix(prefix string) string {
+	return strings.TrimRight(filepath.ToSlash(prefix), "/") + "/"
 }
 
 // WalkDirs calls fn for every subdirectory under root (including root itself)

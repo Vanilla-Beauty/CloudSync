@@ -85,7 +85,11 @@ func NewCOSClient(cfg *config.COSConfig, metadata *MetadataStore, logger *zap.Lo
 	}, nil
 }
 
-// Upload uploads a local file to COS with exponential backoff retry
+// Upload uploads a local file to COS with exponential backoff retry.
+// The file is opened once before entering the retry loop so that a
+// non-existent or permission-denied path fails immediately without burning
+// retry budget. io.NopCloser prevents the HTTP transport from closing the
+// underlying *os.File between attempts, allowing Seek(0,0) to rewind it.
 func (c *COSClient) Upload(ctx context.Context, localPath, remoteKey string) error {
 	f, err := os.Open(localPath)
 	if err != nil {
@@ -94,11 +98,10 @@ func (c *COSClient) Upload(ctx context.Context, localPath, remoteKey string) err
 	defer f.Close()
 
 	return c.withRetry(ctx, func() error {
-		// Reset file position on retry
 		if _, err := f.Seek(0, 0); err != nil {
-			return err
+			return fmt.Errorf("seek %s: %w", localPath, err)
 		}
-		_, err := c.client.Object.Put(ctx, remoteKey, f, nil)
+		_, err := c.client.Object.Put(ctx, remoteKey, io.NopCloser(f), nil)
 		return err
 	})
 }

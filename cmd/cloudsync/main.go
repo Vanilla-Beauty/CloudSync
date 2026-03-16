@@ -16,6 +16,7 @@ import (
 	"github.com/cloudsync/cloudsync/internal/daemon"
 	"github.com/cloudsync/cloudsync/internal/ipc"
 	"github.com/cloudsync/cloudsync/internal/storage"
+	"github.com/cloudsync/cloudsync/pkg/utils"
 	"github.com/kardianos/service"
 	"github.com/spf13/cobra"
 )
@@ -345,7 +346,7 @@ func runMount(path, remote string, fromHome bool, bucket string) error {
 	switch {
 	case remote != "":
 		// Mode 3: explicit remote path
-		prefix = strings.TrimSuffix(remote, "/") + "/"
+		prefix = utils.NormalizeRemotePrefix(remote)
 	case fromHome:
 		// Mode 2: relative to $HOME
 		home, err := os.UserHomeDir()
@@ -356,10 +357,10 @@ func runMount(path, remote string, fromHome bool, bucket string) error {
 		if err != nil || strings.HasPrefix(rel, "..") {
 			return fmt.Errorf("path %s is not under $HOME (%s)", absPath, home)
 		}
-		prefix = filepath.ToSlash(rel) + "/"
+		prefix = utils.NormalizeRemotePrefix(rel)
 	default:
 		// Mode 1: basename only
-		prefix = filepath.Base(absPath) + "/"
+		prefix = utils.NormalizeRemotePrefix(filepath.Base(absPath))
 	}
 
 	client, err := newClient()
@@ -409,7 +410,7 @@ func runPull(remotePrefix, path string, bucket string) error {
 		return fmt.Errorf("create directory: %w", err)
 	}
 
-	prefix := strings.TrimSuffix(remotePrefix, "/") + "/"
+	prefix := utils.NormalizeRemotePrefix(remotePrefix)
 
 	client, err := newClient()
 	if err != nil {
