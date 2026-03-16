@@ -602,7 +602,14 @@ func runLsRemote(bucketOverride, prefix string) error {
 		return err
 	}
 
-	b := newBrowser(cosClient, bucket, prefix)
+	// Best-effort: connect to daemon for interactive delete/sync support.
+	// If the daemon is not running, apiClient is nil and those features are disabled.
+	apiClient, apiErr := newClient()
+	if apiErr != nil {
+		apiClient = nil
+	}
+
+	b := newBrowser(cosClient, bucket, prefix, apiClient)
 	return b.run()
 }
 

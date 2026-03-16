@@ -7,16 +7,32 @@ package main
 //   ↓/j   move down
 //   Enter  expand directory / no-op on file
 //   ←/h   collapse / go to parent
+//   d      delete (confirm with d, cancel with Esc)
+//   s      sync directory (input local path, Enter to confirm, Esc to cancel)
 //   q/Esc  quit
 
 import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
+	"github.com/cloudsync/cloudsync/internal/apiclient"
+	"github.com/cloudsync/cloudsync/internal/ipc"
 	"github.com/cloudsync/cloudsync/internal/storage"
 	"golang.org/x/term"
+)
+
+// ── browser mode state machine ────────────────────────────────────────────────
+
+type browserMode int
+
+const (
+	modeNormal        browserMode = iota
+	modeDeleteConfirm             // waiting for 'd' confirm or Esc cancel
+	modeSyncInput                 // inline path input active
+	modeBusy                      // executing async operation (directory delete)
 )
 
 // ── tree node ────────────────────────────────────────────────────────────────
@@ -48,20 +64,43 @@ func (n *node) label() string {
 // ── browser state ────────────────────────────────────────────────────────────
 
 type browser struct {
-	cos     *storage.COSClient
-	root    []*node // top-level entries
-	flat    []*node // flattened visible list
-	cursor  int
-	offset  int // scroll offset
-	height  int // terminal rows available for content
-	width   int
-	bucket  string
-	prefix  string
-	status  string // status bar message
+	cos    *storage.COSClient
+	root   []*node // top-level entries
+	flat   []*node // flattened visible list
+	cursor int
+	offset int // scroll offset
+	height int // terminal rows available for content
+	width  int
+	bucket string
+	prefix string
+	status string // status bar message
+
+	// mode state machine
+	mode        browserMode
+	pendingNode *node // node targeted by current d/s operation
+
+	// s (sync) input state
+	inputBuf    []rune // current user input, []rune for O(1) backspace
+	defaultPath string // pre-computed default local path
+	inputPrompt string // full prompt string for render
+
+	// daemon integration
+	apiClient *apiclient.Client  // nil = daemon not running
+	mounts    []ipc.MountRecord  // loaded once at startup
 }
 
-func newBrowser(cos *storage.COSClient, bucket, prefix string) *browser {
-	return &browser{cos: cos, bucket: bucket, prefix: prefix}
+func newBrowser(cos *storage.COSClient, bucket, prefix string, apiClient *apiclient.Client) *browser {
+	b := &browser{
+		cos:       cos,
+		bucket:    bucket,
+		prefix:    prefix,
+		apiClient: apiClient,
+	}
+	// Best-effort: load mounts at startup. Failure is silently ignored.
+	if apiClient != nil {
+		b.mounts, _ = apiClient.ListMounts()
+	}
+	return b
 }
 
 func (b *browser) load(ctx context.Context) error {
@@ -162,6 +201,184 @@ func (b *browser) clampCursor() {
 	}
 }
 
+// ── new helper methods ────────────────────────────────────────────────────────
+
+// selectedNode returns the node at the current cursor position, or nil if list is empty.
+func (b *browser) selectedNode() *node {
+	if len(b.flat) == 0 || b.cursor < 0 || b.cursor >= len(b.flat) {
+		return nil
+	}
+	return b.flat[b.cursor]
+}
+
+// findMountForKey returns the first MountRecord whose RemotePrefix is a prefix of key.
+func (b *browser) findMountForKey(key string) *ipc.MountRecord {
+	for i := range b.mounts {
+		if strings.HasPrefix(key, b.mounts[i].RemotePrefix) {
+			return &b.mounts[i]
+		}
+	}
+	return nil
+}
+
+// localPathForKey returns the local path that maps to key via a mount, if any.
+func (b *browser) localPathForKey(key string) (string, bool) {
+	m := b.findMountForKey(key)
+	if m == nil {
+		return "", false
+	}
+	rel := strings.TrimPrefix(key, m.RemotePrefix)
+	return filepath.Join(m.LocalPath, filepath.FromSlash(rel)), true
+}
+
+// findParent recursively searches b.root for the parent of target.
+// Returns nil if target is a top-level node.
+func (b *browser) findParent(target *node) *node {
+	return findParentIn(b.root, target)
+}
+
+func findParentIn(nodes []*node, target *node) *node {
+	for _, n := range nodes {
+		for _, child := range n.children {
+			if child == target {
+				return n
+			}
+		}
+		if found := findParentIn(n.children, target); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+// removeNodeFromTree removes n from the tree (root or parent.children), then
+// rebuilds the flat list and clamps the cursor.
+func (b *browser) removeNodeFromTree(n *node) {
+	parent := b.findParent(n)
+	if parent != nil {
+		parent.children = removeFromSlice(parent.children, n)
+	} else {
+		b.root = removeFromSlice(b.root, n)
+	}
+	b.rebuild()
+	b.clampCursor()
+}
+
+func removeFromSlice(nodes []*node, target *node) []*node {
+	out := nodes[:0]
+	for _, n := range nodes {
+		if n != target {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// executeDelete performs the actual deletion of pendingNode.
+func (b *browser) executeDelete() {
+	n := b.pendingNode
+	if n == nil {
+		b.mode = modeNormal
+		return
+	}
+	ctx := context.Background()
+
+	if n.entry.IsDir {
+		// Directory delete: list all keys then delete each.
+		b.mode = modeBusy
+		b.status = "Deleting..."
+		b.render()
+
+		prefix := n.entry.Prefix
+		keys, err := b.cos.List(ctx, prefix)
+		if err != nil {
+			b.status = "Error: " + err.Error()
+			b.mode = modeNormal
+			b.pendingNode = nil
+			return
+		}
+		var delErr error
+		for _, key := range keys {
+			if err := b.cos.Delete(ctx, key); err != nil {
+				delErr = err
+				break
+			}
+		}
+		if delErr != nil {
+			b.status = "Error: " + delErr.Error()
+			b.mode = modeNormal
+			b.pendingNode = nil
+			return
+		}
+		// Best-effort local cleanup if mounted.
+		if localDir, ok := b.localPathForKey(prefix); ok {
+			_ = os.RemoveAll(localDir)
+		}
+		b.removeNodeFromTree(n)
+		b.status = "Deleted prefix: " + prefix
+	} else {
+		// Single file delete.
+		key := n.entry.Key
+		if err := b.cos.Delete(ctx, key); err != nil {
+			b.status = "Error: " + err.Error()
+			b.mode = modeNormal
+			b.pendingNode = nil
+			return
+		}
+		// Best-effort local cleanup if mounted.
+		if localFile, ok := b.localPathForKey(key); ok {
+			_ = os.Remove(localFile)
+		}
+		b.removeNodeFromTree(n)
+		b.status = "Deleted: " + key
+	}
+
+	b.mode = modeNormal
+	b.pendingNode = nil
+}
+
+// enterSyncMode validates the selection and switches to modeSyncInput.
+func (b *browser) enterSyncMode() {
+	n := b.selectedNode()
+	if n == nil || !n.entry.IsDir {
+		b.status = "s: directories only"
+		return
+	}
+	if b.apiClient == nil {
+		b.status = "Error: daemon not running"
+		return
+	}
+	home, _ := os.UserHomeDir()
+	trimmed := strings.TrimRight(n.entry.Prefix, "/")
+	b.defaultPath = filepath.Join(home, filepath.FromSlash(trimmed))
+	b.inputPrompt = "Sync → local path (default: " + b.defaultPath + "): "
+	b.inputBuf = b.inputBuf[:0]
+	b.pendingNode = n
+	b.mode = modeSyncInput
+}
+
+// executeSync calls AddMount with the user-supplied (or default) local path.
+func (b *browser) executeSync() {
+	localPath := strings.TrimSpace(string(b.inputBuf))
+	if localPath == "" {
+		localPath = b.defaultPath
+	}
+	n := b.pendingNode
+	if n == nil {
+		b.mode = modeNormal
+		return
+	}
+	_, err := b.apiClient.AddMount(localPath, n.entry.Prefix, false, "")
+	if err != nil {
+		b.status = "Error: " + err.Error()
+	} else {
+		b.status = "Syncing: " + localPath + " → " + n.entry.Prefix
+	}
+	b.inputBuf = b.inputBuf[:0]
+	b.pendingNode = nil
+	b.mode = modeNormal
+}
+
 // ── rendering ────────────────────────────────────────────────────────────────
 
 const (
@@ -242,13 +459,44 @@ func (b *browser) render() {
 	sb.WriteString(strings.Repeat("─", w))
 	sb.WriteString(colorReset)
 
-	// Status / help bar
-	help := " ↑↓/jk move   Enter expand   ←/h collapse   q quit"
-	if b.status != "" {
-		help = colorYellow + " " + b.status + colorReset
-	}
+	// Status / help bar (last line) — content depends on mode
 	sb.WriteString(moveTo(h, 1))
-	sb.WriteString(help)
+	switch b.mode {
+	case modeDeleteConfirm:
+		name := ""
+		if b.pendingNode != nil {
+			if b.pendingNode.entry.IsDir {
+				name = dirName(b.pendingNode.entry.Prefix) + "/"
+			} else {
+				name = fileName(b.pendingNode.entry.Key)
+			}
+		}
+		line := colorYellow + " Delete \"" + name + "\"? Press d to confirm, Esc to cancel" + colorReset
+		sb.WriteString(line)
+
+	case modeSyncInput:
+		line := b.inputPrompt + string(b.inputBuf) + "█"
+		// Truncate from left if too wide
+		if visibleLen(line) > w {
+			// Keep right portion that fits
+			runes := []rune(line)
+			for visibleLen(string(runes)) > w && len(runes) > 0 {
+				runes = runes[1:]
+			}
+			line = string(runes)
+		}
+		sb.WriteString(line)
+
+	case modeBusy:
+		sb.WriteString(colorYellow + " " + b.status + colorReset)
+
+	default: // modeNormal
+		help := " ↑↓/jk move   Enter expand   ←/h collapse   d delete   s sync   q quit"
+		if b.status != "" {
+			help = colorYellow + " " + b.status + colorReset
+		}
+		sb.WriteString(help)
+	}
 
 	fmt.Fprint(os.Stdout, sb.String())
 }
@@ -321,21 +569,71 @@ func (b *browser) run() error {
 		if err != nil {
 			return nil
 		}
-		key := buf[:n]
-		switch {
-		case isKey(key, 'q'), isKey(key, 27): // q or Esc
-			return nil
-		case isKey(key, 'j'), isEscape(key, 'B'): // down / ↓
-			b.moveDown()
-		case isKey(key, 'k'), isEscape(key, 'A'): // up / ↑
-			b.moveUp()
-		case isKey(key, 13), isKey(key, ' '): // Enter / Space → expand
-			b.expand(ctx)
-		case isKey(key, 'h'), isEscape(key, 'D'): // h / ← → collapse
-			b.collapse()
-		case isKey(key, 'l'), isEscape(key, 'C'): // l / → → same as Enter
-			b.expand(ctx)
+
+		// In modeBusy: discard all input and just re-render
+		if b.mode == modeBusy {
+			b.render()
+			continue
 		}
+
+		key := buf[:n]
+
+		switch b.mode {
+		case modeDeleteConfirm:
+			switch {
+			case isKey(key, 'd'):
+				b.executeDelete()
+			case isKey(key, 27), isKey(key, 'q'): // Esc or q = cancel
+				b.pendingNode = nil
+				b.mode = modeNormal
+				b.status = "Cancelled"
+			}
+
+		case modeSyncInput:
+			switch {
+			case isKey(key, 13): // Enter
+				b.executeSync()
+			case isKey(key, 27): // Esc = cancel
+				b.inputBuf = b.inputBuf[:0]
+				b.pendingNode = nil
+				b.mode = modeNormal
+				b.status = "Cancelled"
+			case isKey(key, 127), isKey(key, 8): // Backspace / DEL
+				if len(b.inputBuf) > 0 {
+					b.inputBuf = b.inputBuf[:len(b.inputBuf)-1]
+				}
+			default:
+				// Accept printable ASCII
+				if len(key) == 1 && key[0] >= 32 {
+					b.inputBuf = append(b.inputBuf, rune(key[0]))
+				}
+			}
+
+		default: // modeNormal
+			switch {
+			case isKey(key, 'q'), isKey(key, 27): // q or Esc → quit
+				return nil
+			case isKey(key, 'j'), isEscape(key, 'B'): // down / ↓
+				b.moveDown()
+			case isKey(key, 'k'), isEscape(key, 'A'): // up / ↑
+				b.moveUp()
+			case isKey(key, 13), isKey(key, ' '): // Enter / Space → expand
+				b.expand(ctx)
+			case isKey(key, 'h'), isEscape(key, 'D'): // h / ← → collapse
+				b.collapse()
+			case isKey(key, 'l'), isEscape(key, 'C'): // l / → → same as Enter
+				b.expand(ctx)
+			case isKey(key, 'd'): // d → delete
+				if sel := b.selectedNode(); sel != nil {
+					b.pendingNode = sel
+					b.mode = modeDeleteConfirm
+					b.status = ""
+				}
+			case isKey(key, 's'): // s → sync
+				b.enterSyncMode()
+			}
+		}
+
 		b.render()
 	}
 }
