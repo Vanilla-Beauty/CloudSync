@@ -113,9 +113,14 @@ section "Building..."
 BUILD_DIR=$(mktemp -d)
 trap 'rm -rf "$BUILD_DIR"' EXIT
 
+# Resolve version and build time for -ldflags injection
+CS_VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+CS_BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+CS_LDFLAGS="-s -w -X main.version=${CS_VERSION} -X main.buildTime=${CS_BUILD_TIME}"
+
 for bin in "${BINARIES[@]}"; do
   echo -n "  Building $bin ... "
-  if go build -ldflags="-s -w" -o "$BUILD_DIR/$bin" "./cmd/$bin/"; then
+  if go build -ldflags="${CS_LDFLAGS}" -o "$BUILD_DIR/$bin" "./cmd/$bin/"; then
     echo -e "${GREEN}done${RESET}"
   else
     echo -e "${RED}failed${RESET}"

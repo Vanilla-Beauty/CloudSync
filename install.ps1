@@ -120,11 +120,17 @@ Write-Head "Building..."
 $TmpDir = Join-Path $env:TEMP "cloudsync-build-$(Get-Random)"
 New-Item -ItemType Directory -Path $TmpDir | Out-Null
 
+# Resolve version and build time for -ldflags injection
+$CsVersion   = & git describe --tags --always --dirty 2>$null
+if (-not $CsVersion) { $CsVersion = "dev" }
+$CsBuildTime = (Get-Date -AsUTC -Format "yyyy-MM-ddTHH:mm:ssZ")
+$CsLdflags   = "-s -w -X main.version=$CsVersion -X main.buildTime=$CsBuildTime"
+
 try {
     foreach ($bin in @('cloudsync', 'cloudsyncd')) {
         Write-Host "  Building $bin.exe ..." -NoNewline
         $out = Join-Path $TmpDir "$bin.exe"
-        & go build -ldflags="-s -w" -o $out "./cmd/$bin/"
+        & go build -ldflags=$CsLdflags -o $out "./cmd/$bin/"
         if ($LASTEXITCODE -ne 0) {
             Write-Host " FAILED" -ForegroundColor Red
             Write-Err "Build failed for $bin"
