@@ -46,8 +46,23 @@ func rootCmd() *cobra.Command {
 		lsRemoteCmd(),
 		lsBucketCmd(),
 		lsBucketRemoteCmd(),
+		versionCmd(),
 	)
 	return root
+}
+
+// ── version ───────────────────────────────────────────────────────────────────
+
+func versionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Print version, build time, and Go runtime version",
+		Run: func(cmd *cobra.Command, args []string) {
+			fmt.Printf("cloudsync  %s\n", version)
+			fmt.Printf("built      %s\n", buildTime)
+			fmt.Printf("go         %s\n", runtimeGoVersion())
+		},
+	}
 }
 
 // ── init ──────────────────────────────────────────────────────────────────────
