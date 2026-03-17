@@ -130,7 +130,7 @@ try {
     foreach ($bin in @('cloudsync', 'cloudsyncd')) {
         Write-Host "  Building $bin.exe ..." -NoNewline
         $out = Join-Path $TmpDir "$bin.exe"
-        & go build -ldflags=$CsLdflags -o $out "./cmd/$bin/"
+        & go build "-ldflags=$CsLdflags" -o $out "./cmd/$bin/"
         if ($LASTEXITCODE -ne 0) {
             Write-Host " FAILED" -ForegroundColor Red
             Write-Err "Build failed for $bin"
