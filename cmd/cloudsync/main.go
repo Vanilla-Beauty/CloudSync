@@ -186,7 +186,7 @@ func runStart() error {
 	}
 
 	svcCfg := daemon.BuildServiceConfig(daemonPath)
-	svc, err := service.New(daemon.NewProgram(), svcCfg)
+	svc, err := service.New(daemon.NewProgram(""), svcCfg)
 	if err != nil {
 		return fmt.Errorf("service init: %w", err)
 	}
@@ -241,7 +241,7 @@ func runStop() error {
 	}
 	daemonPath := filepath.Join(filepath.Dir(selfPath), daemonName)
 	svcCfg := daemon.BuildServiceConfig(daemonPath)
-	svc, err := service.New(daemon.NewProgram(), svcCfg)
+	svc, err := service.New(daemon.NewProgram(""), svcCfg)
 	if err != nil {
 		return fmt.Errorf("service init: %w", err)
 	}

@@ -19,8 +19,9 @@ type MountManagerAPI interface {
 }
 
 type handlers struct {
-	mm     MountManagerAPI
-	logger *zap.Logger
+	mm      MountManagerAPI
+	logger  *zap.Logger
+	version string
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {
@@ -43,7 +44,7 @@ func (h *handlers) status(w http.ResponseWriter, r *http.Request) {
 		"running":     true,
 		"daemon_pid":  os.Getpid(),
 		"mount_count": h.mm.Count(),
-		"version":     "1.0.0",
+		"version":     h.version,
 	})
 }
 

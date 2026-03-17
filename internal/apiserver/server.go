@@ -13,15 +13,17 @@ import (
 
 // Server serves the REST API over a Unix Domain Socket.
 type Server struct {
-	mm       MountManagerAPI
-	logger   *zap.Logger
-	server   *http.Server
+	mm      MountManagerAPI
+	logger  *zap.Logger
+	server  *http.Server
 	listener net.Listener
+	version string
 }
 
 // NewServer creates a Server with the given mount manager.
-func NewServer(mm MountManagerAPI, logger *zap.Logger) *Server {
-	return &Server{mm: mm, logger: logger}
+// version is the build-time version string injected via ldflags.
+func NewServer(mm MountManagerAPI, logger *zap.Logger, version string) *Server {
+	return &Server{mm: mm, logger: logger, version: version}
 }
 
 // Start removes any stale socket, listens, and serves in a goroutine.
@@ -39,7 +41,7 @@ func (s *Server) Start(socketPath string) error {
 	s.listener = ln
 
 	mux := http.NewServeMux()
-	h := &handlers{mm: s.mm, logger: s.logger}
+	h := &handlers{mm: s.mm, logger: s.logger, version: s.version}
 	mux.HandleFunc("/status", h.status)
 	mux.HandleFunc("/mounts", h.mounts)
 	mux.HandleFunc("/objects/delete", h.deleteObjects)

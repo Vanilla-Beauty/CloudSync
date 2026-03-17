@@ -28,6 +28,7 @@ type Program struct {
 	mountManager *MountManager
 	apiServer    *apiserver.Server
 	stopCh       chan struct{}
+	version      string
 }
 
 // BuildServiceConfig returns the kardianos/service config.
@@ -41,9 +42,10 @@ func BuildServiceConfig(execPath string) *service.Config {
 }
 
 // NewProgram creates the Program struct (without starting).
-func NewProgram() *Program {
+func NewProgram(version string) *Program {
 	return &Program{
-		stopCh: make(chan struct{}),
+		stopCh:  make(chan struct{}),
+		version: version,
 	}
 }
 
@@ -113,7 +115,7 @@ func (p *Program) run() {
 	}
 
 	socketPath, _ := ipc.SocketPath()
-	p.apiServer = apiserver.NewServer(p.mountManager, logger)
+	p.apiServer = apiserver.NewServer(p.mountManager, logger, p.version)
 	if err := p.apiServer.Start(socketPath); err != nil {
 		logger.Error("start API server failed", zap.Error(err))
 		return

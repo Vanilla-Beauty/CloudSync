@@ -9,7 +9,7 @@ import (
 )
 
 func main() {
-	prg := daemon.NewProgram()
+	prg := daemon.NewProgram(version)
 	cfg := daemon.BuildServiceConfig("")
 
 	svc, err := service.New(prg, cfg)
