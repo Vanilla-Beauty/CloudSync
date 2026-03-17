@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -194,25 +195,38 @@ func runStart() error {
 		return fmt.Errorf("cloudsyncd binary not found at %s", daemonPath)
 	}
 
-	svcCfg := daemon.BuildServiceConfig(daemonPath)
-	svc, err := service.New(daemon.NewProgram(""), svcCfg)
-	if err != nil {
-		return fmt.Errorf("service init: %w", err)
-	}
-
-	if err := svc.Install(); err != nil {
-		// If already installed, continue to Start
-		_ = err
-	}
-	if err := svc.Start(); err != nil {
-		// Fall back to direct exec if service start fails (e.g., no root)
+	// On Windows, always launch cloudsyncd directly rather than via the
+	// Windows Service Control Manager.  The SCM runs the service as SYSTEM
+	// in Session 0, where %APPDATA% is unavailable, so the daemon can't
+	// find config.json and exits before creating the Named Pipe.
+	// Windows auto-start is handled separately by enable-autostart.ps1.
+	if runtime.GOOS == "windows" {
 		proc := exec.Command(daemonPath)
 		proc.Stdout = nil
 		proc.Stderr = nil
-		if startErr := proc.Start(); startErr != nil {
-			return fmt.Errorf("start daemon: %w", startErr)
+		if err := proc.Start(); err != nil {
+			return fmt.Errorf("start daemon: %w", err)
 		}
 		_ = proc.Process.Release()
+	} else {
+		svcCfg := daemon.BuildServiceConfig(daemonPath)
+		svc, err := service.New(daemon.NewProgram(""), svcCfg)
+		if err != nil {
+			return fmt.Errorf("service init: %w", err)
+		}
+		if err := svc.Install(); err != nil {
+			_ = err // already installed — continue
+		}
+		if err := svc.Start(); err != nil {
+			// Fall back to direct exec (e.g., no root / systemd unavailable)
+			proc := exec.Command(daemonPath)
+			proc.Stdout = nil
+			proc.Stderr = nil
+			if startErr := proc.Start(); startErr != nil {
+				return fmt.Errorf("start daemon: %w", startErr)
+			}
+			_ = proc.Process.Release()
+		}
 	}
 
 	// Poll until socket responds (up to 5s)

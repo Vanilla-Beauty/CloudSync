@@ -139,6 +139,20 @@ try {
         Write-Host " done" -ForegroundColor Green
     }
 
+    # ── stop running daemon before replacing binaries ─────────────────────────
+
+    Write-Head "Stopping daemon (if running)..."
+    $csExe = Join-Path $InstallDir 'cloudsync.exe'
+    if (Test-Path $csExe) {
+        & $csExe stop 2>$null | Out-Null
+        Start-Sleep -Milliseconds 800
+    }
+    # Belt-and-suspenders: kill any leftover cloudsyncd.exe by name so the
+    # Named Pipe is released before we copy the new binary.
+    Get-Process -Name 'cloudsyncd' -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 400
+
     # ── install ───────────────────────────────────────────────────────────────
 
     Write-Head "Installing to $InstallDir ..."
