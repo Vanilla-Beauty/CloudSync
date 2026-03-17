@@ -30,8 +30,9 @@ func main() {
 
 func rootCmd() *cobra.Command {
 	root := &cobra.Command{
-		Use:   "cloudsync",
-		Short: "CloudSync — sync local folders to Tencent Cloud COS",
+		Use:          "cloudsync",
+		Short:        "CloudSync — sync local folders to Tencent Cloud COS",
+		SilenceUsage: true,
 	}
 	root.AddCommand(
 		initCmd(),
@@ -170,6 +171,14 @@ func runStart() error {
 		return nil
 	}
 
+	// Socket is not responding, but a stale PID file may exist from a previous
+	// crashed instance.  Kill it before starting a fresh one so we never end up
+	// with more than one cloudsyncd process.
+	if err := killStaleDaemon(); err != nil {
+		// Not fatal — the process may already be gone.
+		_ = err
+	}
+
 	// Find cloudsyncd binary in same directory as this binary.
 	// On Windows the binary has a .exe suffix.
 	selfPath, err := os.Executable()
@@ -251,25 +260,9 @@ func runStop() error {
 	}
 
 	// Service manager failed (daemon was started directly, not via systemd/SCM).
-	// Fall back to reading the PID file and terminating the process.
-	pidPath, err := ipc.PIDFilePath()
-	if err != nil {
-		return fmt.Errorf("resolve pid file: %w", err)
-	}
-	data, err := os.ReadFile(pidPath)
-	if err != nil {
-		return fmt.Errorf("daemon is not running (pid file not found)")
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil {
-		return fmt.Errorf("invalid pid file: %w", err)
-	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return fmt.Errorf("process not found: %w", err)
-	}
-	if err := ipc.Terminate(proc); err != nil {
-		return fmt.Errorf("terminate pid %d: %w", pid, err)
+	// Kill by PID file.
+	if err := killStaleDaemon(); err != nil {
+		return err
 	}
 
 	// Wait up to 5 s for daemon to stop (poll via ping).
@@ -283,6 +276,31 @@ func runStop() error {
 		time.Sleep(200 * time.Millisecond)
 	}
 	fmt.Println("cloudsyncd stopped")
+	return nil
+}
+
+// killStaleDaemon reads the PID file and sends SIGTERM to the recorded process.
+// It is used both by stop (primary path) and start (cleanup before re-launch).
+func killStaleDaemon() error {
+	pidPath, err := ipc.PIDFilePath()
+	if err != nil {
+		return fmt.Errorf("resolve pid file: %w", err)
+	}
+	data, err := os.ReadFile(pidPath)
+	if err != nil {
+		return fmt.Errorf("daemon is not running — use 'cloudsync start'")
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return fmt.Errorf("invalid pid file: %w", err)
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return fmt.Errorf("process not found: %w", err)
+	}
+	if err := ipc.Terminate(proc); err != nil {
+		return fmt.Errorf("terminate pid %d: %w", pid, err)
+	}
 	return nil
 }
 
@@ -591,7 +609,11 @@ func newClient() (*apiclient.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return apiclient.NewClient(socketPath), nil
+	c := apiclient.NewClient(socketPath)
+	if err := c.Ping(); err != nil {
+		return nil, fmt.Errorf("daemon is not running — use 'cloudsync start'")
+	}
+	return c, nil
 }
 
 func printMountsTable(mounts []ipc.MountRecord) {
