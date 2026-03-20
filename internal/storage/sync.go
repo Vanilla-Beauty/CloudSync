@@ -96,16 +96,27 @@ func (s *Syncer) syncOne(ctx context.Context, localPath string) {
 }
 
 // DownloadDirectory downloads all objects under remotePrefix to localRoot.
-// After downloading each file, it records its hash in the MetadataStore so
+// After downloading each file it records its hash in the MetadataStore so
 // that the subsequent SyncDirectory scan does not re-upload unchanged files.
+//
+// It also handles remote deletions: any local file whose path is recorded in
+// the MetadataStore (i.e. was previously synced) but whose remote key is no
+// longer present is removed from disk and from the store.
 func (s *Syncer) DownloadDirectory(ctx context.Context) error {
 	keys, err := s.cos.List(ctx, s.remotePrefix)
 	if err != nil {
 		return fmt.Errorf("list remote prefix %q: %w", s.remotePrefix, err)
 	}
 
+	// Build a set of all remote keys for O(1) lookup below.
+	remoteSet := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		remoteSet[k] = struct{}{}
+	}
+
 	prefix := strings.TrimSuffix(s.remotePrefix, "/")
 
+	// ── Download new / updated remote files ──────────────────────────────────
 	var wg sync.WaitGroup
 	for _, key := range keys {
 		wg.Add(1)
@@ -143,6 +154,35 @@ func (s *Syncer) DownloadDirectory(ctx context.Context) error {
 		}(key)
 	}
 	wg.Wait()
+
+	// ── Delete local files whose remote counterpart has been removed ──────────
+	// Walk the local root and check every file that has a MetadataStore record
+	// (meaning it was previously synced).  If its remote key is no longer in
+	// the remote set, the file was deleted on the remote side → remove locally.
+	_ = filepath.Walk(s.localRoot, func(localPath string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		if _, tracked := s.metadata.GetFileHash(localPath); !tracked {
+			// File was never synced (e.g. new local file awaiting upload) — leave it.
+			return nil
+		}
+		remoteKey := s.remoteKey(localPath)
+		if _, exists := remoteSet[remoteKey]; exists {
+			return nil // still present remotely, nothing to do
+		}
+		// Remote file gone: remove local copy and clear metadata record.
+		if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+			s.logger.Warn("remote-deletion: failed to remove local file",
+				zap.String("path", localPath), zap.Error(err))
+			return nil
+		}
+		s.metadata.DeleteFileHash(localPath)
+		s.logger.Info("remote-deletion: removed local file",
+			zap.String("path", localPath), zap.String("key", remoteKey))
+		return nil
+	})
+
 	return nil
 }
 

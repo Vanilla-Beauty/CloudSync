@@ -61,7 +61,13 @@ func (m *MetadataStore) SetSyncStatus(path string, status *SyncStatus) {
 	m.status[path] = status
 }
 
-// HashFile computes the SHA-256 hash of a file using streaming I/O
+// DeleteFileHash removes the hash record for a local path.
+// Called when a file is deleted locally as a result of a remote deletion.
+func (m *MetadataStore) DeleteFileHash(path string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.hashes, path)
+}
 func HashFile(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
