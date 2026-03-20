@@ -135,7 +135,30 @@ func (c *Client) RemoveMount(localPath string, deleteRemote bool) error {
 	return nil
 }
 
-// DeleteObjects asks the daemon to asynchronously delete all COS objects under
+// SyncMount asks the daemon to pull remote changes for localPath and upload
+// any local changes. Blocks until the sync completes (or the daemon returns
+// an error). Use this for `cloudsync sync <path>`.
+// Note: uses a longer timeout than other calls since a full directory scan
+// may take time on large mounts.
+func (c *Client) SyncMount(localPath string) error {
+	// Create a client with a longer timeout for this potentially slow operation.
+	syncClient := &http.Client{
+		Transport: c.httpClient.Transport,
+		Timeout:   15 * time.Minute,
+	}
+	body, _ := json.Marshal(map[string]string{"local_path": localPath})
+	resp, err := syncClient.Post(c.baseURL+"/mounts/sync", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("daemon is not running — use 'cloudsync start'")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		var e map[string]string
+		_ = json.NewDecoder(resp.Body).Decode(&e)
+		return fmt.Errorf("sync failed: %s", e["error"])
+	}
+	return nil
+}
 // remotePrefix. The daemon also removes corresponding local files if they fall
 // under a known mount. The call returns as soon as the daemon has accepted the
 // request (HTTP 202); actual deletion happens in the daemon's background.

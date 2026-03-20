@@ -44,6 +44,7 @@ func (s *Server) Start(socketPath string) error {
 	h := &handlers{mm: s.mm, logger: s.logger, version: s.version}
 	mux.HandleFunc("/status", h.status)
 	mux.HandleFunc("/mounts", h.mounts)
+	mux.HandleFunc("/mounts/sync", h.syncMount)
 	mux.HandleFunc("/objects/delete", h.deleteObjects)
 
 	s.server = &http.Server{Handler: mux}

@@ -44,6 +44,7 @@ func rootCmd() *cobra.Command {
 		pullCmd(),
 		unmountCmd(),
 		deleteCmd(),
+		syncCmd(),
 		lsCmd(),
 		lsRemoteCmd(),
 		lsBucketCmd(),
@@ -540,6 +541,42 @@ func runDelete(path string) error {
 		return err
 	}
 	fmt.Printf("Deleted remote files and unmounted: %s\n", absPath)
+	return nil
+}
+
+// ── sync ──────────────────────────────────────────────────────────────────────
+
+func syncCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "sync <path>",
+		Short: "Pull remote changes for a mount and upload local changes",
+		Long: `Trigger an immediate bidirectional sync for a mounted directory:
+  1. Download any remote files that are newer than the local copy
+  2. Upload any local files that changed since the last sync
+
+This is the recommended way to pick up changes made on another machine
+when polling is disabled (the default).`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runSync(args[0])
+		},
+	}
+}
+
+func runSync(path string) error {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("resolve path: %w", err)
+	}
+	client, err := newClient()
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Syncing %s ...\n", absPath)
+	if err := client.SyncMount(absPath); err != nil {
+		return err
+	}
+	fmt.Println("Done.")
 	return nil
 }
 

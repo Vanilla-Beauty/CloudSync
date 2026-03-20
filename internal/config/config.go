@@ -29,10 +29,19 @@ type LogConfig struct {
 	Format string `json:"format"`
 }
 
+// SyncConfig holds remote-pull settings
+type SyncConfig struct {
+	// PollIntervalSec controls how often cloudsyncd checks for remote changes
+	// and downloads them.  0 (the default) disables polling; users can trigger
+	// a manual pull with `cloudsync sync <path>` at any time.
+	PollIntervalSec int `json:"poll_interval_sec"`
+}
+
 // Config is the root configuration structure stored in config.json
 type Config struct {
 	COS         COSConfig         `json:"cos"`
 	Performance PerformanceConfig `json:"performance"`
+	Sync        SyncConfig        `json:"sync"`
 	Log         LogConfig         `json:"log"`
 }
 
@@ -48,6 +57,9 @@ func DefaultConfig() *Config {
 			BatchMaxSize:    100,
 			MaxConcurrent:   3,
 			QPS:             10,
+		},
+		Sync: SyncConfig{
+			PollIntervalSec: 0, // polling disabled by default
 		},
 		Log: LogConfig{
 			Level:  "info",

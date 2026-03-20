@@ -27,6 +27,7 @@ type watcherEntry struct {
 	record  ipc.MountRecord
 	watcher *watcher.SyncWatcher
 	cos     *storage.COSClient // may differ from mm.cos when per-mount bucket is set
+	cancel  context.CancelFunc // cancels the polling goroutine (if any)
 }
 
 // MountManager manages the lifecycle of watched directories and persists them.
@@ -216,8 +217,57 @@ func (mm *MountManager) StopAll() {
 	mm.mu.Lock()
 	defer mm.mu.Unlock()
 	for _, e := range mm.entries {
+		if e.cancel != nil {
+			e.cancel()
+		}
 		e.watcher.Stop()
 	}
+}
+
+// SyncMount performs an immediate pull of remote changes for the mount whose
+// LocalPath matches localPath.  It downloads any remote objects newer than
+// what the MetadataStore has recorded, then runs a normal upload scan.
+// This is the building block for both manual `cloudsync sync` and polling.
+func (mm *MountManager) SyncMount(localPath string) error {
+	mm.mu.RLock()
+	var found *watcherEntry
+	for _, e := range mm.entries {
+		if e.record.LocalPath == localPath {
+			found = e
+			break
+		}
+	}
+	mm.mu.RUnlock()
+
+	if found == nil {
+		return fmt.Errorf("no mount found for path: %s", localPath)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	rec := found.record
+	syncer := storage.NewSyncer(found.cos, mm.metadata, mm.rl, mm.logger, rec.LocalPath, rec.RemotePrefix)
+	ignorePath := filepath.Join(rec.LocalPath, ".syncignore")
+	ignoreRules, _ := filter.LoadIgnoreRules(ignorePath)
+	swapDetector := filter.NewSwapDetector()
+	syncer.SetIgnoreFunc(func(path string) bool {
+		rel, err := filepath.Rel(rec.LocalPath, path)
+		if err != nil {
+			rel = path
+		}
+		return ignoreRules.Match(rel) || swapDetector.IsSwapFile(path)
+	})
+
+	mm.logger.Info("syncing mount (pull+push)", zap.String("path", rec.LocalPath))
+	if err := syncer.DownloadDirectory(ctx); err != nil {
+		mm.logger.Warn("sync: download failed", zap.String("path", rec.LocalPath), zap.Error(err))
+	}
+	if err := syncer.SyncDirectory(ctx); err != nil {
+		mm.logger.Warn("sync: upload scan failed", zap.String("path", rec.LocalPath), zap.Error(err))
+	}
+	mm.logger.Info("sync complete", zap.String("path", rec.LocalPath))
+	return nil
 }
 
 // startWatcher creates and starts a SyncWatcher for the given record.
@@ -302,6 +352,31 @@ func (mm *MountManager) startWatcher(rec ipc.MountRecord, downloadFirst bool) er
 			mm.logger.Warn("initial sync failed", zap.String("path", rec.LocalPath), zap.Error(err))
 		}
 	}()
+
+	// Start periodic polling goroutine if enabled in config.
+	if secs := mm.cfg.Sync.PollIntervalSec; secs > 0 {
+		pollCtx, pollCancel := context.WithCancel(context.Background())
+		mm.mu.Lock()
+		if e, ok := mm.entries[rec.ID]; ok {
+			e.cancel = pollCancel
+		} else {
+			pollCancel() // entry gone (shouldn't happen), release immediately
+		}
+		mm.mu.Unlock()
+		go func() {
+			ticker := time.NewTicker(time.Duration(secs) * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-pollCtx.Done():
+					return
+				case <-ticker.C:
+					mm.logger.Debug("poll: checking remote changes", zap.String("path", rec.LocalPath))
+					_ = mm.SyncMount(rec.LocalPath)
+				}
+			}
+		}()
+	}
 
 	return nil
 }

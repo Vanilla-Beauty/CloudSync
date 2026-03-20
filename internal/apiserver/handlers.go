@@ -16,6 +16,7 @@ type MountManagerAPI interface {
 	List() []ipc.MountRecord
 	Count() int
 	DeleteObjects(remotePrefix string)
+	SyncMount(localPath string) error
 }
 
 type handlers struct {
@@ -117,7 +118,30 @@ func (h *handlers) removeMount(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// POST /objects/delete — fire-and-forget deletion of a COS prefix or key.
+// POST /mounts/sync — pull remote changes for a single mount (synchronous).
+func (h *handlers) syncMount(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		LocalPath string `json:"local_path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	if req.LocalPath == "" {
+		writeError(w, http.StatusBadRequest, "local_path is required")
+		return
+	}
+	if err := h.mm.SyncMount(req.LocalPath); err != nil {
+		h.logger.Warn("sync mount failed", zap.Error(err))
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
 func (h *handlers) deleteObjects(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
